@@ -1,0 +1,348 @@
+---
+title: "Flight Delay Prediction"
+subtitle: "36-673 Final Project"
+author: "Ellie Huang (elliehua) and Nikita Jayaprakash (njayapra)"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 7,
+  fig.height = 4
+)
+
+library(tidyverse)
+library(here)
+library(janitor)
+library(lubridate)
+library(skimr)
+```
+
+---
+
+# Data Loading
+
+> **Note for teammates:** CSV files should live in a `data/` subfolder relative
+> to this .Rmd. Same folder layout on both machines and `here` handles the rest:
+>
+> ```
+> project/
+>   data/
+>     flights2023.csv  flights2024.csv
+>     flights2025.csv  flights2025_visible.csv  flights2025_guess.csv
+>   36673_Final_Project.Rmd
+> ```
+
+```{r load-raw}
+flights_2023 <- read_csv(here("data", "flights2023.csv"), show_col_types = FALSE) |>
+  clean_names()
+
+flights_2024 <- read_csv(here("data", "flights2024.csv"), show_col_types = FALSE) |>
+  clean_names()
+
+# full 2025 file = visible + guess combined
+flights_test_all     <- read_csv(here("data", "flights2025.csv"),         show_col_types = FALSE) |> clean_names()
+flights_test_visible <- read_csv(here("data", "flights2025_visible.csv"), show_col_types = FALSE) |> clean_names()
+flights_test_guess   <- read_csv(here("data", "flights2025_guess.csv"),   show_col_types = FALSE) |> clean_names()
+
+cat("row counts — 2023:", nrow(flights_2023),
+    " | 2024:", nrow(flights_2024),
+    " | 2025 all:", nrow(flights_test_all),
+    " | visible:", nrow(flights_test_visible),
+    " | guess:", nrow(flights_test_guess), "\n")
+```
+
+---
+
+# Cleaning & Feature Engineering
+
+Apply the same cleaning to every data frame so train and test always match.
+Add new feature ideas here and they'll propagate automatically.
+
+```{r clean-fn}
+clean_flights <- function(df) {
+  df |>
+    mutate(
+      # date
+      fl_date = as.Date(fl_date),
+
+      # departure hour from scheduled time (dep_time is NA in guess rows — that's fine)
+      sched_dep_hour = floor(crs_dep_time / 100),
+      dep_hour       = floor(dep_time / 100),
+
+      # calendar
+      month       = factor(month, levels = 1:12),
+      day_of_week = factor(day_of_week, levels = 1:7,
+                           labels = c("Mon","Tue","Wed","Thu","Fri","Sat","Sun")),
+
+      # target (numeric for modelling)
+      dep_del15 = as.numeric(dep_del15),
+
+      # key categoricals
+      op_unique_carrier = factor(op_unique_carrier),
+      origin            = factor(origin),
+      dest              = factor(dest)
+    )
+}
+
+flights_2023         <- clean_flights(flights_2023)
+flights_2024         <- clean_flights(flights_2024)
+flights_test_all     <- clean_flights(flights_test_all)
+flights_test_visible <- clean_flights(flights_test_visible)
+flights_test_guess   <- clean_flights(flights_test_guess)
+```
+
+---
+
+# Separating Departures vs. Arrivals
+
+We only predict departures from PIT. Arrivals are kept separately — they're
+useful later for features like "was the inbound plane late?"
+
+```{r split-dep-arr}
+# departures only, years combined
+train <- bind_rows(
+  flights_2023 |> filter(origin == "PIT") |> mutate(data_year = 2023),
+  flights_2024 |> filter(origin == "PIT") |> mutate(data_year = 2024)
+)
+
+# arrivals saved for potential feature engineering
+arrivals_train <- bind_rows(
+  flights_2023 |> filter(dest == "PIT") |> mutate(data_year = 2023),
+  flights_2024 |> filter(dest == "PIT") |> mutate(data_year = 2024)
+)
+
+# test splits
+test_visible <- flights_test_visible |> filter(origin == "PIT")
+test_guess   <- flights_test_guess   |> filter(origin == "PIT")
+
+cat("train:", nrow(train), "| test_visible:", nrow(test_visible),
+    "| test_guess:", nrow(test_guess),
+    "| arrivals (for features):", nrow(arrivals_train), "\n")
+```
+
+---
+
+# Data Validation
+
+Sanity checks before modelling. These should all pass silently — investigate
+anything that prints a warning.
+
+```{r validate}
+# target is 0/1 with no unexpected values
+stopifnot(all(train$dep_del15 %in% c(0, 1), na.rm = TRUE))
+cat("✓ dep_del15 is 0/1\n")
+
+# leakage check — these fields should all be NA in the guess set
+leakage_cols <- c("dep_time", "dep_delay", "dep_delay_new", "dep_del15",
+                  "taxi_out", "wheels_off", "arr_time", "arr_delay",
+                  "cancelled", "actual_elapsed_time", "carrier_delay",
+                  "weather_delay", "nas_delay", "late_aircraft_delay")
+
+leaked <- leakage_cols[
+  leakage_cols %in% names(test_guess) &
+  sapply(leakage_cols, \(col) !all(is.na(test_guess[[col]])))
+]
+if (length(leaked) == 0) cat("✓ no leakage columns populated in test_guess\n") else
+  warning("leakage found: ", paste(leaked, collapse = ", "))
+
+# missing target rate and date coverage
+cat(sprintf("  missing dep_del15 in train: %d (%.2f%%)\n",
+            sum(is.na(train$dep_del15)),
+            100 * mean(is.na(train$dep_del15))))
+cat(sprintf("  train: %s to %s\n", min(train$fl_date), max(train$fl_date)))
+cat(sprintf("  test_guess: %s to %s\n", min(test_guess$fl_date), max(test_guess$fl_date)))
+```
+
+---
+
+# Initial EDA
+
+## Target Distribution
+
+```{r eda-target}
+train |>
+  count(dep_del15) |>
+  mutate(pct = round(100 * n / sum(n), 1)) |>
+  rename(delayed = dep_del15)
+
+train |>
+  filter(!is.na(dep_del15)) |>
+  ggplot(aes(x = factor(dep_del15, labels = c("On time", "Delayed ≥15 min")))) +
+  geom_bar(fill = c("steelblue", "tomato"), width = 0.5) +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.4) +
+  labs(title = "Departure delay distribution (PIT departures, 2023–2024)",
+       x = NULL, y = "Flights") +
+  theme_minimal()
+```
+
+The classes are imbalanced — roughly 80/20 on-time vs. delayed. This is
+typical for flight data and worth keeping in mind when choosing a threshold
+for binary predictions (defaulting to 0.5 will bias toward predicting on-time).
+AUC is our actual metric so this matters less for model selection, but it's
+relevant if we need calibrated probabilities or set a custom threshold.
+
+## Missingness
+
+```{r eda-missing}
+train |>
+  summarise(across(everything(), ~ mean(is.na(.)))) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "pct_missing") |>
+  filter(pct_missing > 0) |>
+  arrange(desc(pct_missing)) |>
+  mutate(pct_missing = round(100 * pct_missing, 2)) |>
+  print(n = 40)
+```
+
+Most missingness is in the delay-reason columns (carrier delay, weather delay,
+etc.), which we can't use for prediction anyway. What matters is whether any
+pre-departure features we plan to use — distance, CRS times, tail number —
+have meaningful missingness. Those would need imputation or a missingness
+indicator before modelling.
+
+## Delay Rate by Carrier
+
+```{r eda-carrier}
+train |>
+  filter(!is.na(dep_del15)) |>
+  group_by(op_unique_carrier) |>
+  summarise(n_flights  = n(),
+            delay_rate = mean(dep_del15),
+            .groups = "drop") |>
+  arrange(desc(delay_rate)) |>
+  ggplot(aes(x = reorder(op_unique_carrier, delay_rate), y = delay_rate)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = scales::percent(delay_rate, accuracy = 1)),
+            hjust = -0.1, size = 3) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 0.5)) +
+  coord_flip() +
+  labs(title = "Delay rate by carrier (PIT departures, 2023–2024)",
+       x = "Carrier", y = "Proportion delayed ≥15 min") +
+  theme_minimal()
+```
+
+There's meaningful variation across carriers, so carrier should be a useful
+predictor. Be cautious with carriers that have very few flights at PIT — their
+delay rates will be noisy and could overfit. Consider smoothing small-volume
+carriers toward the overall mean or grouping them into an "other" category.
+
+## Delay Rate by Month
+
+```{r eda-month}
+train |>
+  filter(!is.na(dep_del15)) |>
+  group_by(month) |>
+  summarise(delay_rate = mean(dep_del15), n = n(), .groups = "drop") |>
+  ggplot(aes(x = month, y = delay_rate, group = 1)) +
+  geom_line(color = "steelblue") +
+  geom_point(aes(size = n), color = "steelblue") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_discrete(labels = month.abb) +
+  labs(title = "Delay rate by month",
+       x = "Month", y = "Proportion delayed", size = "# flights") +
+  theme_minimal()
+```
+
+Delay rates peak in summer (June–August) and around the winter holidays
+(December), consistent with high-traffic periods and weather. Spring and fall
+are lower-risk. The seasonal pattern also suggests that weather data (if we
+add it) would have the most impact in winter and summer months.
+
+## Delay Rate by Day of Week
+
+```{r eda-dow}
+train |>
+  filter(!is.na(dep_del15)) |>
+  group_by(day_of_week) |>
+  summarise(delay_rate = mean(dep_del15), .groups = "drop") |>
+  ggplot(aes(x = day_of_week, y = delay_rate)) +
+  geom_col(fill = "steelblue") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Delay rate by day of week", x = NULL, y = "Proportion delayed") +
+  theme_minimal()
+```
+
+The day-of-week effect is real but modest. Thursdays and Fridays tend to be
+slightly worse, likely due to higher traffic as people travel for weekends.
+Saturdays are often the most punctual day, consistent with lower overall demand.
+Useful as a feature but probably not a top predictor on its own — most valuable
+in combination with hour and month.
+
+## Delay Rate by Scheduled Departure Hour
+
+```{r eda-hour}
+train |>
+  filter(!is.na(dep_del15), !is.na(sched_dep_hour)) |>
+  group_by(sched_dep_hour) |>
+  summarise(delay_rate = mean(dep_del15), n = n(), .groups = "drop") |>
+  ggplot(aes(x = sched_dep_hour, y = delay_rate)) +
+  geom_line(color = "steelblue") +
+  geom_point(aes(size = n), color = "steelblue") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_continuous(breaks = seq(5, 23, 2)) +
+  labs(title = "Delay rate by scheduled departure hour",
+       x = "Scheduled departure hour", y = "Proportion delayed", size = "# flights") +
+  theme_minimal()
+```
+
+This is probably the strongest single signal we have. Delays increase steadily
+through the day and peak in the evening — the classic delay cascade, where a
+late plane from an earlier leg ripples forward. Early morning departures (5–7am)
+are the most punctual since aircraft are freshly repositioned overnight.
+`sched_dep_hour` should be a top feature in any model we try.
+
+## Top Destinations from PIT
+
+```{r eda-dest}
+train |>
+  count(dest, sort = TRUE) |>
+  slice_head(n = 15) |>
+  ggplot(aes(x = reorder(dest, n), y = n)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 15 destinations from PIT (2023–2024)",
+       x = "Destination", y = "Number of flights") +
+  theme_minimal()
+```
+
+The dominant routes are hubs (ORD, ATL, CLT, etc.), which makes sense for a
+mid-size airport like PIT. Hub routes see more traffic and are more exposed to
+system-wide delays. It's worth checking whether delay rates differ meaningfully
+by destination — flights into congested hubs may be more likely to be held.
+Route-level delay rates could be a useful engineered feature down the line.
+
+---
+
+# Quick Summary (skimr)
+
+```{r skim}
+# just the columns we expect to use — keeps output manageable
+key_cols <- c("dep_del15", "op_unique_carrier", "dest", "month",
+              "day_of_week", "sched_dep_hour", "crs_elapsed_time",
+              "distance", "data_year")
+
+skim(train[, intersect(key_cols, names(train))])
+```
+
+---
+
+# Next Steps (TODO)
+
+- [ ] Feature engineering: rolling delay rates by carrier/route/hour
+- [ ] Use arrivals data — was the inbound plane late? (strong signal)
+- [ ] External weather data for PIT (ASOS / OpenWeather)
+- [ ] Baseline: logistic regression with features above
+- [ ] CV setup to estimate AUC on held-out data
+- [ ] Try xgboost/lightgbm and compare
+
+```{r session-info, include=FALSE}
+sessionInfo()
+```

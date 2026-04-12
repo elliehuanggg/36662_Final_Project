@@ -1,0 +1,80 @@
+"0","# Missingness"
+"0","colSums(is.na(flights_train[, c(""dep_del15"", ""dep_time"", ""crs_dep_time"")]))"
+"1","   dep_del15 "
+"1","    dep_time "
+"1","crs_dep_time "
+"1","
+"
+"1","         950 "
+"1","         950 "
+"1","           0 "
+"1","
+"
+"0","flights_train |>"
+"0","  summarise(across(everything(), ~mean(is.na(.)))) |>"
+"0","  pivot_longer(everything(), names_to = ""variable"", values_to = ""pct_missing"") |>"
+"0","  filter(pct_missing > 0) |>"
+"0","  arrange(desc(pct_missing)) |>"
+"0","  print(n = 30)"
+"1","[38;5;246m# A tibble: 28 × 2[39m
+"
+"1","   variable            pct_missing
+"
+"1","   [3m[38;5;246m<chr>[39m[23m                     [3m[38;5;246m<dbl>[39m[23m
+"
+"1","[38;5;250m 1[39m first_dep_time          0.995  
+"
+"1","[38;5;250m 2[39m total_add_gtime         0.995  
+"
+"1","[38;5;250m 3[39m longest_add_gtime       0.995  
+"
+"1","[38;5;250m 4[39m cancellation_code       0.986  
+"
+"1","[38;5;250m 5[39m carrier_delay           0.837  
+"
+"1","[38;5;250m 6[39m weather_delay           0.837  
+"
+"1","[38;5;250m 7[39m nas_delay               0.837  
+"
+"1","[38;5;250m 8[39m security_delay          0.837  
+"
+"1","[38;5;250m 9[39m late_aircraft_delay     0.837  
+"
+"1","[38;5;250m10[39m fl_date                 0.609  
+"
+"1","[38;5;250m11[39m arr_delay               0.015[4m4[24m 
+"
+"1","[38;5;250m12[39m arr_delay_new           0.015[4m4[24m 
+"
+"1","[38;5;250m13[39m arr_del15               0.015[4m4[24m 
+"
+"1","[38;5;250m14[39m arr_delay_group         0.015[4m4[24m 
+"
+"1","[38;5;250m15[39m actual_elapsed_time     0.015[4m4[24m 
+"
+"1","[38;5;250m16[39m air_time                0.015[4m4[24m 
+"
+"1","[38;5;250m17[39m wheels_on               0.013[4m8[24m 
+"
+"1","[38;5;250m18[39m taxi_in                 0.013[4m8[24m 
+"
+"1","[38;5;250m19[39m arr_time                0.013[4m8[24m 
+"
+"1","[38;5;250m20[39m taxi_out                0.013[4m7[24m 
+"
+"1","[38;5;250m21[39m wheels_off              0.013[4m7[24m 
+"
+"1","[38;5;250m22[39m dep_time                0.013[4m3[24m 
+"
+"1","[38;5;250m23[39m dep_delay               0.013[4m3[24m 
+"
+"1","[38;5;250m24[39m dep_delay_new           0.013[4m3[24m 
+"
+"1","[38;5;250m25[39m dep_del15               0.013[4m3[24m 
+"
+"1","[38;5;250m26[39m dep_delay_group         0.013[4m3[24m 
+"
+"1","[38;5;250m27[39m dep_hour                0.013[4m3[24m 
+"
+"1","[38;5;250m28[39m tail_num                0.001[4m5[24m[4m8[24m
+"

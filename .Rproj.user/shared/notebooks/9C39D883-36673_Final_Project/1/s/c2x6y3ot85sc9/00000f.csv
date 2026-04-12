@@ -1,0 +1,5 @@
+"0","# Delay rate by carrier (stacked bar)"
+"0","flights_train |>"
+"0","  ggplot(aes(x = op_unique_carrier, fill = factor(dep_del15))) +"
+"0","  geom_bar(position = ""fill"") +"
+"0","  coord_flip()"
