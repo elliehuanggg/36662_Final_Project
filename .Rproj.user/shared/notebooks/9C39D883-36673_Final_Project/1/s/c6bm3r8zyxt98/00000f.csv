@@ -1,4 +1,0 @@
-"0","# Delay rate by departure time"
-"0","flights_train |>"
-"0","  ggplot(aes(x = dep_time)) +"
-"0","  geom_histogram(bins = 40)"

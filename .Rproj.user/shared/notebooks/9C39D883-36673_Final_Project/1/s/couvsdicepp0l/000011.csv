@@ -1,5 +1,0 @@
-"0",""
-"0","flights_train |>"
-"0","  ggplot(aes(x = factor(dep_del15, labels = c(""on time"", ""delayed"")))) +"
-"0","  geom_bar() +"
-"0","  labs(title = ""Departure delay distribution"", x = NULL, y = ""count"")"

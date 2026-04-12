@@ -1,4 +1,0 @@
-"0","# Top destinations"
-"0","flights_train |>"
-"0","  count(dest, sort = TRUE) |>"
-"0","  slice_head(n = 15)"
