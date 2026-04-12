@@ -6,6 +6,10 @@ date: "2026-04-22"
 output: pdf_document
 ---
 
+# Data Prep
+
+## Load Libraries and Data
+
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 
@@ -39,6 +43,8 @@ flights_train <- bind_rows(
   flights_2024 |> mutate(data_year = 2024)
 )
 ```
+
+## Data Prep
 
 ```{r}
 # Cleaning function — apply to all data frames so train and test are consistent
@@ -81,6 +87,8 @@ table(flights_train$dep_del15, useNA = "ifany")
 
 # Exploratory Data Analysis
 
+## Missingness
+
 ```{r}
 # Missingness
 colSums(is.na(flights_train[, c("dep_del15", "dep_time", "crs_dep_time")]))
@@ -95,6 +103,10 @@ flights_train |>
 
 Most of the missingness is in delay + reason columns (carrier delay, weather delay, etc.) that we can't use for prediction anyway. The main thing we should check is whether any pre-departure features we actually plan to use have meaningful gaps.
 
+**NOTE: add analysis for missingness, see if there's any patterns to missingness (and if we can include missingness in modelling)**
+
+## Departure Delay Dist
+
 ```{r}
 # Target distribution
 flights_train |>
@@ -108,8 +120,9 @@ flights_train |>
 
 The classes are roughly 80/20 on-time vs. delayed. Since AUC is our evaluation metric this imbalance isn't too concerning, but it's worth keeping in mind if we end up picking a classification threshold later.
 
+## Carrier Delay
+
 ```{r}
-# Delay rate by carrier
 flights_train |>
   filter(!is.na(dep_del15)) |>
   group_by(op_unique_carrier) |>
@@ -122,6 +135,8 @@ flights_train |>
 ```
 
 There's variation across carriers, so this should be a useful predictor. Carriers with very few flights at PIT will have noisy estimates though, so need to think about smoothing or grouping when we get to feature engineering.
+
+## Time-of-Day Delays
 
 ```{r}
 # Departure time distribution and delay rate by hour
@@ -141,6 +156,8 @@ flights_train |>
 ```
 
 Delays increase steadily through the day and peak in the evening. This is likely due to the effect of a late plane from an earlier leg holding up the next departure. Early morning flights are the most on-time since planes are freshly repositioned overnight. `sched_dep_hour` is probably one of our most useful features.
+
+## Delay Rates
 
 ```{r}
 # Delay rate by carrier (stacked bar)
@@ -172,6 +189,28 @@ flights_train |>
 ```
 
 Delays are noticeably worse in summer (June–August) and December, which lines up with peak travel and weather. The day-of-week pattern is subtler — Thursdays and Fridays are slightly worse, Tuesdays are the best day to fly with the lowest proprtion of delayed flught. Both are worth including as features but probably won't carry as much weight as hour or carrier.
+
+```{r}
+# Delay rate by date of year
+flights_train |>
+  filter(!is.na(dep_del15)) |>
+  # fix later, but to make comparable dates
+  mutate(date = make_date(year = 2010, month = month, day = day_of_month)) |>
+  group_by(date) |>
+  summarise(delay_rate = mean(dep_del15), .groups = "drop") |>
+  ggplot(aes(x = date, y = delay_rate)) +
+  geom_line() +
+  scale_x_date(date_labels = "%b", date_breaks = "1 month") +
+  labs(
+    title = "Daily delay rate (2023–2024)",
+    x = NULL,
+    y = "proportion delayed >= 15 min"
+  )
+```
+
+The monthly peaks are not uniform across the entire month. While it would add too many degrees of freedom to the model, it may be worth to feature-engineer high-peak indicator. It seems to overlap with academic breaks (i.e. spring break, winter break, summer break).
+
+## Top Destinations
 
 ```{r}
 # Top destinations
