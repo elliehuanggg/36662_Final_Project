@@ -11,13 +11,18 @@ output: pdf_document
 ## Load Libraries and Data
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, warning = FALSE, message = FALSE)
 
 library(tidyverse)
+library(tidymodels)
 library(here)
 library(janitor)
 library(lubridate)
 library(skimr)
+library(scales)
+library(forcats)
+library(ranger)
+library(xgboost)
 ```
 
 ```{r}
@@ -44,21 +49,20 @@ flights_train <- bind_rows(
 )
 ```
 
-## Data Prep
+## Clean and Filter Data
 
 ```{r}
-# Cleaning function — apply to all data frames so train and test are consistent
+# Apply the same cleaning steps to each data frame so train and test sets are consistent
 clean_flights <- function(df) {
   df |>
     clean_names() |>
     mutate(
-      fl_date = as.Date(fl_date),  # date
-      dep_del15 = as.numeric(dep_del15),  # target
-      op_unique_carrier = as.factor(op_unique_carrier),  # factors
+      fl_date = as.Date(fl_date),
+      dep_del15 = as.numeric(dep_del15),
+      op_unique_carrier = as.factor(op_unique_carrier),
       origin = as.factor(origin),
       dest = as.factor(dest),
-      dep_hour = floor(dep_time / 100),  # time features
-      sched_dep_hour = floor(crs_dep_time / 100),  # use this for test rows where dep_time is NA
+      sched_dep_hour = floor(crs_dep_time / 100),
       month = as.factor(month),
       day_of_week = as.factor(day_of_week)
     )
@@ -71,7 +75,7 @@ flights_test_guess <- clean_flights(flights_test_guess)
 ```
 
 ```{r}
-# Filter for only departures
+# Restrict to departures from PIT
 flights_train <- flights_train |>
   filter(origin == "PIT")
 
@@ -81,18 +85,23 @@ flights_test_visible <- flights_test_visible |>
 flights_test_guess <- flights_test_guess |>
   filter(origin == "PIT")
 
-# Check target distribution
+# Quick check of the target distribution
 table(flights_train$dep_del15, useNA = "ifany")
 ```
 
+We focus on Pittsburgh departures because that is the airport represented in the prediction task. We also use `sched_dep_hour` rather than actual departure time, since actual departure time is not available for the flights we need to predict.
+
 # Exploratory Data Analysis
+
+The goal of the EDA is not just to describe the data, but to identify patterns that are both predictive and available before departure. In particular, we want to see whether delay risk depends in a stable way on scheduling, carrier, route, seasonality, and same-day operating conditions.
 
 ## Missingness
 
 ```{r}
-# Missingness
+# Missingness in the main timing and target fields
 colSums(is.na(flights_train[, c("dep_del15", "dep_time", "crs_dep_time")]))
 
+# Variables with nonzero missingness
 flights_train |>
   summarise(across(everything(), ~mean(is.na(.)))) |>
   pivot_longer(everything(), names_to = "variable", values_to = "pct_missing") |>
@@ -101,11 +110,31 @@ flights_train |>
   print(n = 30)
 ```
 
-Most of the missingness is in delay + reason columns (carrier delay, weather delay, etc.) that we can't use for prediction anyway. The main thing we should check is whether any pre-departure features we actually plan to use have meaningful gaps.
+```{r}
+# Missingness among key pre-departure predictors
+key_predictors <- c(
+  "dep_del15", "crs_dep_time", "sched_dep_hour", "op_unique_carrier",
+  "dest", "distance", "month", "day_of_week", "flights"
+)
 
-**NOTE: add analysis for missingness, see if there's any patterns to missingness (and if we can include missingness in modelling)**
+key_predictors <- intersect(key_predictors, names(flights_train))
 
-## Departure Delay Dist
+flights_train |>
+  summarise(across(all_of(key_predictors), ~mean(is.na(.)))) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "pct_missing") |>
+  mutate(pct_missing = percent(pct_missing, accuracy = 0.1))
+```
+
+```{r}
+# Check whether missing targets line up with likely cancellations
+flights_train |>
+  mutate(cancelled_proxy = is.na(dep_time) & is.na(dep_del15)) |>
+  count(cancelled_proxy, missing_target = is.na(dep_del15))
+```
+
+Missing target values align exactly with likely cancellations, so this is not unexplained missingness. We therefore treat these rows as cancelled flights and exclude them from the delay prediction task.
+
+## Departure Delay Distribution
 
 ```{r}
 # Target distribution
@@ -115,108 +144,702 @@ flights_train |>
 flights_train |>
   ggplot(aes(x = factor(dep_del15, labels = c("on time", "delayed")))) +
   geom_bar() +
-  labs(title = "Departure delay distribution", x = NULL, y = "count")
+  labs(
+    title = "Departure delay distribution",
+    x = NULL,
+    y = "count"
+  )
 ```
 
-The classes are roughly 80/20 on-time vs. delayed. Since AUC is our evaluation metric this imbalance isn't too concerning, but it's worth keeping in mind if we end up picking a classification threshold later.
+The classes are roughly 80/20 on-time versus delayed. This imbalance is worth keeping in mind, but it is not too concerning since our main evaluation metric is AUC rather than raw accuracy.
 
-## Carrier Delay
+## Delay Rate by Carrier
 
 ```{r}
-flights_train |>
+carrier_delay_tbl <- flights_train |>
   filter(!is.na(dep_del15)) |>
   group_by(op_unique_carrier) |>
-  summarise(delay_rate = mean(dep_del15), n = n(), .groups = "drop") |>
-  arrange(desc(delay_rate)) |>
+  summarise(
+    delay_rate = mean(dep_del15),
+    n = n(),
+    .groups = "drop"
+  ) |>
+  arrange(desc(delay_rate))
+
+carrier_delay_tbl |>
   ggplot(aes(x = reorder(op_unique_carrier, delay_rate), y = delay_rate)) +
   geom_col() +
   coord_flip() +
-  labs(title = "Delay rate by carrier", x = "carrier", y = "proportion delayed >= 15 min")
+  scale_y_continuous(labels = percent_format()) +
+  labs(
+    title = "Delay rate by carrier",
+    x = "carrier",
+    y = "proportion delayed >= 15 min"
+  ) +
+  theme_minimal()
 ```
 
-There's variation across carriers, so this should be a useful predictor. Carriers with very few flights at PIT will have noisy estimates though, so need to think about smoothing or grouping when we get to feature engineering.
+Delay rates vary meaningfully across carriers, so carrier should be a useful predictor. At the same time, some carriers have much lower flight counts at PIT than others, so raw group means will be noisy. That motivates using smoothed historical delay rates later in feature engineering instead of unsmoothed averages.
 
-## Time-of-Day Delays
+## Delay Rate by Scheduled Departure Hour
 
 ```{r}
-# Departure time distribution and delay rate by hour
+# Distribution of scheduled departure times
 flights_train |>
-  ggplot(aes(x = dep_time)) +
-  geom_histogram(bins = 40) +
-  labs(title = "Distribution of departure times", x = "departure time", y = "count")
+  ggplot(aes(x = sched_dep_hour)) +
+  geom_histogram(binwidth = 1, boundary = 0, closed = "left") +
+  scale_x_continuous(breaks = 0:23) +
+  labs(
+    title = "Distribution of scheduled departure hours",
+    x = "scheduled departure hour",
+    y = "count"
+  ) +
+  theme_minimal()
+```
 
-flights_train |>
+```{r}
+hour_delay_tbl <- flights_train |>
   filter(!is.na(dep_del15), !is.na(sched_dep_hour)) |>
   group_by(sched_dep_hour) |>
-  summarise(delay_rate = mean(dep_del15), .groups = "drop") |>
+  summarise(
+    delay_rate = mean(dep_del15),
+    n = n(),
+    .groups = "drop"
+  )
+
+hour_delay_tbl |>
   ggplot(aes(x = sched_dep_hour, y = delay_rate)) +
   geom_line() +
   geom_point() +
-  labs(title = "Delay rate by scheduled departure hour", x = "hour", y = "proportion delayed >= 15 min")
+  scale_x_continuous(breaks = 0:23) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(
+    title = "Delay rate by scheduled departure hour",
+    x = "scheduled departure hour",
+    y = "proportion delayed >= 15 min"
+  ) +
+  theme_minimal()
 ```
 
-Delays increase steadily through the day and peak in the evening. This is likely due to the effect of a late plane from an earlier leg holding up the next departure. Early morning flights are the most on-time since planes are freshly repositioned overnight. `sched_dep_hour` is probably one of our most useful features.
+Delay rates rise steadily over the course of the day and are highest in the evening. This fits the idea of cascading delays: early flights start the day with fewer disruptions from previous legs, while later flights are more exposed to effects from earlier problems. This makes scheduled departure hour one of the strongest single predictors in the dataset.
 
-## Delay Rates
+## Carrier-by-Hour Interaction
 
 ```{r}
-# Delay rate by carrier (stacked bar)
-flights_train |>
-  ggplot(aes(x = op_unique_carrier, fill = factor(dep_del15))) +
-  geom_bar(position = "fill") +
-  coord_flip() +
-  labs(title = "Delay proportion by carrier", x = "carrier", y = "proportion", fill = "delayed")
+carrier_hour_tbl <- flights_train |>
+  filter(!is.na(dep_del15), !is.na(sched_dep_hour)) |>
+  group_by(op_unique_carrier, sched_dep_hour) |>
+  summarise(
+    delay_rate = mean(dep_del15),
+    n = n(),
+    .groups = "drop"
+  ) |>
+  filter(n >= 20)
 
+carrier_hour_tbl |>
+  ggplot(
+    aes(
+      x = sched_dep_hour,
+      y = fct_reorder(op_unique_carrier, delay_rate, .fun = mean),
+      fill = delay_rate
+    )
+  ) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(labels = percent_format(accuracy = 1)) +
+  labs(
+    title = "Delay rate by carrier and scheduled departure hour",
+    subtitle = "Carrier differences are not constant across the day",
+    x = "scheduled departure hour",
+    y = "carrier",
+    fill = "delay rate"
+  ) +
+  theme_minimal()
+```
+
+The carrier effect is not the same at every hour. Some carriers remain fairly stable across the day, while others become much more delay-prone in the evening. This suggests that a model with only main effects may miss meaningful structure, so either an explicit carrier-by-hour feature or a nonlinear model should help.
+
+## Seasonality and Calendar Effects
+
+```{r}
 # Delay rate by month
 flights_train |>
   filter(!is.na(dep_del15)) |>
   group_by(month) |>
-  summarise(delay_rate = mean(dep_del15), .groups = "drop") |>
+  summarise(
+    delay_rate = mean(dep_del15),
+    .groups = "drop"
+  ) |>
   ggplot(aes(x = month, y = delay_rate, group = 1)) +
   geom_line() +
   geom_point() +
-  labs(title = "Delay rate by month", x = "month", y = "proportion delayed >= 15 min")
+  scale_y_continuous(labels = percent_format()) +
+  labs(
+    title = "Delay rate by month",
+    x = "month",
+    y = "proportion delayed >= 15 min"
+  ) +
+  theme_minimal()
+```
 
+```{r}
 # Delay rate by day of week
 flights_train |>
   filter(!is.na(dep_del15)) |>
   group_by(day_of_week) |>
-  summarise(delay_rate = mean(dep_del15), .groups = "drop") |>
+  summarise(
+    delay_rate = mean(dep_del15),
+    .groups = "drop"
+  ) |>
   ggplot(aes(x = day_of_week, y = delay_rate, group = 1)) +
   geom_line() +
   geom_point() +
-  labs(title = "Delay rate by day of week", x = NULL, y = "proportion delayed >= 15 min")
-```
-
-Delays are noticeably worse in summer (June–August) and December, which lines up with peak travel and weather. The day-of-week pattern is subtler — Thursdays and Fridays are slightly worse, Tuesdays are the best day to fly with the lowest proprtion of delayed flught. Both are worth including as features but probably won't carry as much weight as hour or carrier.
-
-```{r}
-# Delay rate by date of year
-flights_train |>
-  filter(!is.na(dep_del15)) |>
-  # fix later, but to make comparable dates
-  mutate(date = make_date(year = 2010, month = month, day = day_of_month)) |>
-  group_by(date) |>
-  summarise(delay_rate = mean(dep_del15), .groups = "drop") |>
-  ggplot(aes(x = date, y = delay_rate)) +
-  geom_line() +
-  scale_x_date(date_labels = "%b", date_breaks = "1 month") +
+  scale_y_continuous(labels = percent_format()) +
   labs(
-    title = "Daily delay rate (2023–2024)",
+    title = "Delay rate by day of week",
     x = NULL,
     y = "proportion delayed >= 15 min"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Delay rate by calendar date, aligned to a common year for display
+flights_train |>
+  filter(!is.na(dep_del15)) |>
+  mutate(plot_date = make_date(year = 2010, month = as.integer(as.character(month)), day = day_of_month)) |>
+  group_by(plot_date) |>
+  summarise(
+    delay_rate = mean(dep_del15),
+    .groups = "drop"
+  ) |>
+  ggplot(aes(x = plot_date, y = delay_rate)) +
+  geom_line() +
+  scale_x_date(date_labels = "%b", date_breaks = "1 month") +
+  scale_y_continuous(labels = percent_format()) +
+  labs(
+    title = "Daily delay rate across the calendar year",
+    x = NULL,
+    y = "proportion delayed >= 15 min"
+  ) +
+  theme_minimal()
+```
+
+Delays are worse in the summer months and in December, which is consistent with heavier travel volume and more weather-related disruption. The day-of-week pattern is milder, but it still suggests that weekly operating patterns contain some signal. The daily calendar plot also shows that these seasonal peaks are not spread evenly across the month, which supports adding a simple calendar feature rather than relying only on month.
+
+## Destination and Distance Effects
+
+```{r}
+top_dests <- flights_train |>
+  count(dest, sort = TRUE) |>
+  slice_head(n = 15) |>
+  pull(dest)
+
+flights_train |>
+  filter(!is.na(dep_del15), dest %in% top_dests) |>
+  group_by(dest) |>
+  summarise(
+    delay_rate = mean(dep_del15),
+    n = n(),
+    .groups = "drop"
+  ) |>
+  arrange(delay_rate) |>
+  ggplot(aes(x = reorder(dest, delay_rate), y = delay_rate)) +
+  geom_col() +
+  coord_flip() +
+  scale_y_continuous(labels = percent_format()) +
+  labs(
+    title = "Delay rate among the busiest PIT destinations",
+    x = "destination",
+    y = "proportion delayed >= 15 min"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+flights_train <- flights_train |>
+  mutate(
+    distance_bucket = case_when(
+      distance > 600 ~ ">600",
+      distance > 300 ~ "301-600",
+      TRUE ~ "<=300"
+    ),
+    distance_bucket = factor(
+      distance_bucket,
+      levels = c("<=300", "301-600", ">600")
+    )
+  )
+
+flights_train |>
+  filter(!is.na(dep_del15), !is.na(distance_bucket)) |>
+  group_by(distance_bucket) |>
+  summarise(
+    delay_rate = mean(dep_del15),
+    n = n(),
+    .groups = "drop"
+  ) |>
+  ggplot(aes(x = distance_bucket, y = delay_rate)) +
+  geom_col() +
+  scale_y_continuous(labels = percent_format()) +
+  labs(
+    title = "Longer routes have higher delay rates",
+    x = "distance bucket",
+    y = "proportion delayed >= 15 min"
+  ) +
+  theme_minimal()
+```
+
+Delay rates differ across destinations, even among the busiest PIT routes, which suggests that route context adds information beyond carrier and time of day alone. Longer routes also show higher delay rates on average, so distance should remain in the model and may be easier to capture through both a raw continuous version and a bucketed factor version
+
+## High-Delay Days
+
+```{r}
+bad_days_tbl <- flights_train |>
+  filter(!is.na(dep_del15)) |>
+  group_by(fl_date) |>
+  summarise(
+    delay_rate = mean(dep_del15),
+    n = n(),
+    .groups = "drop"
+  ) |>
+  filter(n >= 10) |>
+  arrange(desc(delay_rate))
+
+bad_days_tbl |>
+  slice_head(n = 20) |>
+  ggplot(aes(x = reorder(as.character(fl_date), delay_rate), y = delay_rate)) +
+  geom_col() +
+  coord_flip() +
+  scale_y_continuous(labels = percent_format()) +
+  labs(
+    title = "A small number of dates have very high delay rates",
+    x = "date",
+    y = "proportion delayed >= 15 min"
+  ) +
+  theme_minimal()
+```
+
+A small number of days have unusually high delay rates, which suggests that there are broader operating shocks affecting many flights at once. That motivates adding dynamic same-day features based on earlier visible flights, along with a historical calendar-day disruption feature learned from the training data.
+
+# Feature Engineering
+
+The EDA suggests that delay risk depends on a mix of stable historical tendencies and day-specific operating conditions. Based on those patterns, we engineer features that capture time-of-day effects, carrier and route history, route distance, seasonality, and same-day disruption.
+
+## Add Basic Modeling Features
+
+```{r}
+add_basic_features <- function(df) {
+  df |>
+    mutate(
+      peak_season = if_else(as.integer(as.character(month)) %in% c(6, 7, 8, 12), 1, 0),
+      is_evening = if_else(sched_dep_hour >= 18, 1, 0),
+      is_morning = if_else(sched_dep_hour <= 8, 1, 0),
+      distance_bucket = case_when(
+        distance > 600 ~ ">600",
+        distance > 300 ~ "301-600",
+        TRUE ~ "<=300"
+      ),
+      carrier_hour = paste(op_unique_carrier, sched_dep_hour, sep = "_")
+    )
+}
+
+flights_train <- add_basic_features(flights_train)
+flights_test_visible <- add_basic_features(flights_test_visible)
+flights_test_guess <- add_basic_features(flights_test_guess)
+```
+
+These features directly reflect the strongest patterns from the EDA. In particular, `peak_season`, the morning and evening indicators, the distance bucket, and the carrier-by-hour combination all transform observed structure in the data into modeling variables.
+
+## Build Smoothed Historical Delay-Rate Features
+
+```{r}
+global_delay_rate <- mean(flights_train$dep_del15, na.rm = TRUE)
+
+make_smoothed_rates <- function(df, group_var, target = "dep_del15", m = 100) {
+  group_sym <- rlang::sym(group_var)
+  target_sym <- rlang::sym(target)
+
+  df |>
+    filter(!is.na(!!target_sym)) |>
+    group_by(!!group_sym) |>
+    summarise(
+      n = n(),
+      mean_target = mean(!!target_sym),
+      .groups = "drop"
+    ) |>
+    mutate(
+      smoothed_rate = (n * mean_target + m * global_delay_rate) / (n + m)
+    ) |>
+    select(!!group_sym, smoothed_rate, n)
+}
+```
+
+```{r}
+carrier_rates <- make_smoothed_rates(flights_train, "op_unique_carrier", m = 200) |>
+  rename(
+    carrier_delay_rate_smooth = smoothed_rate,
+    carrier_n = n
+  )
+
+dest_rates <- make_smoothed_rates(flights_train, "dest", m = 200) |>
+  rename(
+    dest_delay_rate_smooth = smoothed_rate,
+    dest_n = n
+  )
+
+carrier_hour_rates <- make_smoothed_rates(flights_train, "carrier_hour", m = 100) |>
+  rename(
+    carrier_hour_delay_rate_smooth = smoothed_rate,
+    carrier_hour_n = n
+  )
+
+flight_num_rates <- make_smoothed_rates(flights_train, "flights", m = 150) |>
+  rename(
+    flight_num_delay_rate_smooth = smoothed_rate,
+    flight_num_n = n
   )
 ```
 
-The monthly peaks are not uniform across the entire month. While it would add too many degrees of freedom to the model, it may be worth to feature-engineer high-peak indicator. It seems to overlap with academic breaks (i.e. spring break, winter break, summer break).
+Rather than using raw historical means, we shrink each group toward the global average when the number of observations is small. This makes the features more stable, especially for carriers, routes, or flight numbers that appear only a limited number of times at PIT.
 
-## Top Destinations
+## Apply Historical Features to Train and Test
 
 ```{r}
-# Top destinations
-flights_train |>
-  count(dest, sort = TRUE) |>
-  slice_head(n = 15)
+apply_rate_features <- function(df) {
+  df |>
+    left_join(carrier_rates, by = "op_unique_carrier") |>
+    left_join(dest_rates, by = "dest") |>
+    left_join(carrier_hour_rates, by = "carrier_hour") |>
+    left_join(flight_num_rates, by = "flights") |>
+    mutate(
+      carrier_delay_rate_smooth = coalesce(carrier_delay_rate_smooth, global_delay_rate),
+      dest_delay_rate_smooth = coalesce(dest_delay_rate_smooth, global_delay_rate),
+      carrier_hour_delay_rate_smooth = coalesce(carrier_hour_delay_rate_smooth, global_delay_rate),
+      flight_num_delay_rate_smooth = coalesce(flight_num_delay_rate_smooth, global_delay_rate)
+    )
+}
+
+flights_train_fe <- apply_rate_features(flights_train)
+flights_test_visible_fe <- apply_rate_features(flights_test_visible)
+flights_test_guess_fe <- apply_rate_features(flights_test_guess)
 ```
 
-The most common routes are to major hubs (LGA, ORD, ATL, etc.), which makes sense for an airport PIT's size. Flights into busy hubs tend to be more delay-prone, so route-level delay rates could be a useful feature to engineer.
+All of these encodings are learned using the training data and then applied to the test sets. If a group in the test set was not seen in training, we fall back to the global delay rate.
+
+## Add Running Same-Day Delay Features
+
+```{r}
+add_running_day_features <- function(df) {
+  df |>
+    arrange(fl_date, crs_dep_time) |>
+    group_by(fl_date) |>
+    mutate(
+      flights_before_today = row_number() - 1,
+      delays_before_today = lag(cumsum(replace_na(dep_del15, 0)), default = 0),
+      prior_same_day_delay_rate = if_else(
+        flights_before_today > 0,
+        delays_before_today / flights_before_today,
+        0
+      )
+    ) |>
+    ungroup()
+}
+
+flights_train_fe <- add_running_day_features(flights_train_fe)
+```
+
+This feature captures how disrupted the system already is earlier in the day. It is especially useful because the prediction setup gives visibility into earlier flights on the same date.
+
+```{r}
+test_visible_day_summary <- flights_test_visible_fe |>
+  filter(!is.na(dep_del15)) |>
+  group_by(fl_date) |>
+  summarise(
+    visible_flights_count = n(),
+    visible_delay_rate = mean(dep_del15),
+    .groups = "drop"
+  )
+
+flights_test_guess_fe <- flights_test_guess_fe |>
+  left_join(test_visible_day_summary, by = "fl_date") |>
+  mutate(
+    visible_flights_count = coalesce(visible_flights_count, 0),
+    visible_delay_rate = coalesce(visible_delay_rate, global_delay_rate)
+  )
+```
+
+For the guess set, we cannot directly use the unknown future labels. Instead, we summarize the flights that are already visible on that date and merge those day-level summaries into the flights we need to predict.
+
+## Add Historical High-Disruption Calendar Signal
+
+```{r}
+bad_day_lookup <- flights_train |>
+  filter(!is.na(dep_del15)) |>
+  group_by(month, day_of_month) |>
+  summarise(
+    avg_delay_rate_for_calendar_day = mean(dep_del15),
+    .groups = "drop"
+  ) |>
+  mutate(
+    high_disruption_calendar_day = if_else(
+      avg_delay_rate_for_calendar_day >= quantile(avg_delay_rate_for_calendar_day, 0.90),
+      1,
+      0
+    )
+  )
+
+flights_train_fe <- flights_train_fe |>
+  left_join(bad_day_lookup, by = c("month", "day_of_month"))
+
+flights_test_visible_fe <- flights_test_visible_fe |>
+  left_join(bad_day_lookup, by = c("month", "day_of_month"))
+
+flights_test_guess_fe <- flights_test_guess_fe |>
+  left_join(bad_day_lookup, by = c("month", "day_of_month"))
+```
+
+This feature is meant to capture recurring calendar periods that tend to have higher disruption, without adding a large number of very specific date indicators to the model.
+
+## Final Modeling Data Frames
+
+```{r}
+model_vars <- c(
+  "dep_del15",
+  "sched_dep_hour",
+  "op_unique_carrier",
+  "dest",
+  "distance",
+  "distance_bucket",
+  "month",
+  "day_of_week",
+  "peak_season",
+  "is_evening",
+  "is_morning",
+  "carrier_delay_rate_smooth",
+  "dest_delay_rate_smooth",
+  "carrier_hour_delay_rate_smooth",
+  "flight_num_delay_rate_smooth",
+  "prior_same_day_delay_rate",
+  "flights_before_today",
+  "avg_delay_rate_for_calendar_day",
+  "high_disruption_calendar_day"
+)
+
+train_model_df <- flights_train_fe |>
+  select(any_of(model_vars)) |>
+  filter(!is.na(dep_del15))
+
+test_guess_model_df <- flights_test_guess_fe |>
+  select(any_of(setdiff(model_vars, "dep_del15")))
+```
+
+At this point, `train_model_df` contains the response and engineered predictors for model fitting, while `test_guess_model_df` contains the same predictors for the flights we need to score. The final feature set reflects the main conclusions from the EDA: time of day is a major driver, carrier, destination, route are important, and same-day disruption adds useful information.
+
+# Modeling + Predictions
+
+```{r}
+set.seed(123)
+
+#--------------------------------------------------
+# 1. Build modeling data
+#--------------------------------------------------
+
+baseline_vars <- c(
+  "dep_del15",
+  "sched_dep_hour",
+  "op_unique_carrier",
+  "dest",
+  "distance",
+  "month",
+  "day_of_week",
+  "peak_season",
+  "distance_bucket"
+)
+
+enhanced_vars <- c(
+  baseline_vars,
+  "carrier_delay_rate_smooth",
+  "dest_delay_rate_smooth",
+  "carrier_hour_delay_rate_smooth",
+  "prior_same_day_delay_rate",
+  "high_disruption_calendar_day"
+)
+
+baseline_df <- flights_train_fe |>
+  filter(!is.na(dep_del15)) |>
+  select(any_of(baseline_vars)) |>
+  mutate(
+    dep_del15 = if_else(dep_del15 == 1, "delayed", "on_time"),
+    dep_del15 = factor(dep_del15, levels = c("delayed", "on_time")),
+    row_id = row_number()
+  )
+
+enhanced_df <- flights_train_fe |>
+  filter(!is.na(dep_del15)) |>
+  select(any_of(enhanced_vars)) |>
+  mutate(
+    dep_del15 = if_else(dep_del15 == 1, "delayed", "on_time"),
+    dep_del15 = factor(dep_del15, levels = c("delayed", "on_time")),
+    row_id = row_number()
+  )
+
+#--------------------------------------------------
+# 2. Create one shared split
+#--------------------------------------------------
+
+data_split <- initial_split(baseline_df, prop = 0.8, strata = dep_del15)
+
+baseline_train <- training(data_split)
+baseline_valid <- testing(data_split)
+
+enhanced_train <- enhanced_df |>
+  semi_join(baseline_train |> select(row_id), by = "row_id")
+
+enhanced_valid <- enhanced_df |>
+  semi_join(baseline_valid |> select(row_id), by = "row_id")
+
+#--------------------------------------------------
+# 3. Define recipes
+#--------------------------------------------------
+
+baseline_recipe <- recipe(dep_del15 ~ ., data = baseline_train) |>
+  update_role(row_id, new_role = "id") |>
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors()) |>
+  step_impute_mean(all_numeric_predictors())
+
+enhanced_recipe <- recipe(dep_del15 ~ ., data = enhanced_train) |>
+  update_role(row_id, new_role = "id") |>
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors()) |>
+  step_impute_mean(all_numeric_predictors())
+
+#--------------------------------------------------
+# 4. Logistic regression specification
+#--------------------------------------------------
+
+log_spec <- logistic_reg() |>
+  set_engine("glm")
+
+#--------------------------------------------------
+# 5. Workflows
+#--------------------------------------------------
+
+baseline_wf <- workflow() |>
+  add_recipe(baseline_recipe) |>
+  add_model(log_spec)
+
+enhanced_wf <- workflow() |>
+  add_recipe(enhanced_recipe) |>
+  add_model(log_spec)
+
+#--------------------------------------------------
+# 6. Fit baseline model
+#--------------------------------------------------
+
+baseline_fit <- fit(baseline_wf, data = baseline_train)
+
+baseline_valid_preds <- baseline_valid |>
+  select(dep_del15, row_id) |>
+  bind_cols(predict(baseline_fit, baseline_valid, type = "prob"))
+
+baseline_auc <- roc_auc(
+  baseline_valid_preds,
+  truth = dep_del15,
+  .pred_delayed
+) |>
+  mutate(model = "Baseline logistic")
+
+#--------------------------------------------------
+# 7. Fit enhanced model
+#--------------------------------------------------
+
+enhanced_fit <- fit(enhanced_wf, data = enhanced_train)
+
+enhanced_valid_preds <- enhanced_valid |>
+  select(dep_del15, row_id) |>
+  bind_cols(predict(enhanced_fit, enhanced_valid, type = "prob"))
+
+enhanced_auc <- roc_auc(
+  enhanced_valid_preds,
+  truth = dep_del15,
+  .pred_delayed
+) |>
+  mutate(model = "Enhanced logistic")
+
+#--------------------------------------------------
+# 8. Compare model performance
+#--------------------------------------------------
+
+bind_rows(baseline_auc, enhanced_auc) |>
+  select(model, .estimate)
+```
+
+```{r}
+set.seed(123)
+
+xgb_folds <- vfold_cv(enhanced_train, v = 3, strata = dep_del15)
+xgb_recipe <- recipe(dep_del15 ~ ., data = enhanced_train) |>
+  update_role(row_id, new_role = "id") |>
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors()) |>
+  step_impute_mean(all_numeric_predictors())
+
+xgb_spec <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  min_n = tune(),
+  loss_reduction = tune(),
+  sample_size = 0.8
+) |>
+  set_engine("xgboost") |>
+  set_mode("classification")
+
+xgb_wf <- workflow() |>
+  add_recipe(xgb_recipe) |>
+  add_model(xgb_spec)
+
+xgb_grid <- tibble::tibble(
+  trees = c(100L, 200L, 300L, 200L),
+  tree_depth = c(2L, 2L, 3L, 4L),
+  learn_rate = c(0.05, 0.10, 0.05, 0.05),
+  min_n = c(20L, 20L, 15L, 30L),
+  loss_reduction = c(0, 0, 0, 1)
+)
+
+xgb_res <- tune_grid(
+  xgb_wf,
+  resamples = xgb_folds,
+  grid = xgb_grid,
+  metrics = metric_set(roc_auc)
+)
+
+show_best(xgb_res, metric = "roc_auc")
+best_xgb <- select_best(xgb_res, metric = "roc_auc")
+best_xgb
+
+final_xgb_wf <- finalize_workflow(xgb_wf, best_xgb)
+
+final_xgb_fit <- fit(final_xgb_wf, data = enhanced_train)
+
+xgb_valid_preds <- enhanced_valid |>
+  select(dep_del15, row_id) |>
+  bind_cols(predict(final_xgb_fit, enhanced_valid, type = "prob"))
+
+xgb_auc <- roc_auc(
+  xgb_valid_preds,
+  truth = dep_del15,
+  .pred_delayed
+) |>
+  mutate(model = "XGBoost")
+
+xgb_auc
+
+bind_rows(
+  baseline_auc,
+  enhanced_auc,
+  xgb_auc
+) |>
+  select(model, .estimate)
+```
+
