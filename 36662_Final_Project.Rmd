@@ -775,8 +775,6 @@ bind_rows(baseline_auc, enhanced_auc) |>
 ```
 
 ```{r}
-set.seed(123)
-
 xgb_folds <- vfold_cv(enhanced_train, v = 3, strata = dep_del15)
 xgb_recipe <- recipe(dep_del15 ~ ., data = enhanced_train) |>
   update_role(row_id, new_role = "id") |>
@@ -832,8 +830,6 @@ xgb_auc <- roc_auc(
   .pred_delayed
 ) |>
   mutate(model = "XGBoost")
-
-xgb_auc
 
 bind_rows(
   baseline_auc,
