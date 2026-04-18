@@ -27,25 +27,25 @@ library(xgboost)
 
 ```{r}
 # Load data
-flights_2023 <- read_csv(here("data", "flights2023.csv")) |>
+flights2023 <- read_csv(here("data", "flights2023.csv")) |>
   clean_names()
 
-flights_2024 <- read_csv(here("data", "flights2024.csv")) |>
+flights2024 <- read_csv(here("data", "flights2024.csv")) |>
   clean_names()
 
-flights_test <- read_csv(here("data", "flights2025.csv")) |>
+test <- read_csv(here("data", "flights2025.csv")) |>
   clean_names()
 
-flights_test_visible <- read_csv(here("data", "flights2025_visible.csv")) |>
+test_visible <- read_csv(here("data", "flights2025_visible.csv")) |>
   clean_names()
 
-flights_test_guess <- read_csv(here("data", "flights2025_guess.csv")) |>
+test_guess <- read_csv(here("data", "flights2025_guess.csv")) |>
   clean_names()
 
 # Build training set
-flights_train <- bind_rows(
-  flights_2023 |> mutate(data_year = 2023),
-  flights_2024 |> mutate(data_year = 2024)
+train <- bind_rows(
+  flights2023 |> mutate(data_year = 2023),
+  flights2024 |> mutate(data_year = 2024)
 )
 ```
 
@@ -68,25 +68,25 @@ clean_flights <- function(df) {
     )
 }
 
-flights_train <- clean_flights(flights_train)
-flights_test <- clean_flights(flights_test)
-flights_test_visible <- clean_flights(flights_test_visible)
-flights_test_guess <- clean_flights(flights_test_guess)
+train <- clean_flights(train)
+test <- clean_flights(test)
+test_visible <- clean_flights(test_visible)
+test_guess <- clean_flights(test_guess)
 ```
 
 ```{r}
 # Restrict to departures from PIT
-flights_train <- flights_train |>
+train <- train |>
   filter(origin == "PIT")
 
-flights_test_visible <- flights_test_visible |>
+test_visible <- test_visible |>
   filter(origin == "PIT")
 
-flights_test_guess <- flights_test_guess |>
+test_guess <- test_guess |>
   filter(origin == "PIT")
 
 # Quick check of the target distribution
-table(flights_train$dep_del15, useNA = "ifany")
+table(train$dep_del15, useNA = "ifany")
 ```
 
 We focus on Pittsburgh departures because that is the airport represented in the prediction task. We also use `sched_dep_hour` rather than actual departure time, since actual departure time is not available for the flights we need to predict.
@@ -99,10 +99,10 @@ The goal of the EDA is not just to describe the data, but to identify patterns t
 
 ```{r}
 # Missingness in the main timing and target fields
-colSums(is.na(flights_train[, c("dep_del15", "dep_time", "crs_dep_time")]))
+colSums(is.na(train[, c("dep_del15", "dep_time", "crs_dep_time")]))
 
 # Variables with nonzero missingness
-flights_train |>
+train |>
   summarise(across(everything(), ~mean(is.na(.)))) |>
   pivot_longer(everything(), names_to = "variable", values_to = "pct_missing") |>
   filter(pct_missing > 0) |>
@@ -117,9 +117,9 @@ key_predictors <- c(
   "dest", "distance", "month", "day_of_week", "flights"
 )
 
-key_predictors <- intersect(key_predictors, names(flights_train))
+key_predictors <- intersect(key_predictors, names(train))
 
-flights_train |>
+train |>
   summarise(across(all_of(key_predictors), ~mean(is.na(.)))) |>
   pivot_longer(everything(), names_to = "variable", values_to = "pct_missing") |>
   mutate(pct_missing = percent(pct_missing, accuracy = 0.1))
@@ -127,7 +127,7 @@ flights_train |>
 
 ```{r}
 # Check whether missing targets line up with likely cancellations
-flights_train |>
+train |>
   mutate(cancelled_proxy = is.na(dep_time) & is.na(dep_del15)) |>
   count(cancelled_proxy, missing_target = is.na(dep_del15))
 ```
@@ -138,10 +138,10 @@ Missing target values align exactly with likely cancellations, so this is not un
 
 ```{r}
 # Target distribution
-flights_train |>
+train |>
   count(dep_del15)
 
-flights_train |>
+train |>
   ggplot(aes(x = factor(dep_del15, labels = c("on time", "delayed")))) +
   geom_bar() +
   labs(
@@ -156,7 +156,7 @@ The classes are roughly 80/20 on-time versus delayed. This imbalance is worth ke
 ## Delay Rate by Carrier
 
 ```{r}
-carrier_delay_tbl <- flights_train |>
+carrier_delay_tbl <- train |>
   filter(!is.na(dep_del15)) |>
   group_by(op_unique_carrier) |>
   summarise(
@@ -185,7 +185,7 @@ Delay rates vary meaningfully across carriers, so carrier should be a useful pre
 
 ```{r}
 # Distribution of scheduled departure times
-flights_train |>
+train |>
   ggplot(aes(x = sched_dep_hour)) +
   geom_histogram(binwidth = 1, boundary = 0, closed = "left") +
   scale_x_continuous(breaks = 0:23) +
@@ -198,7 +198,7 @@ flights_train |>
 ```
 
 ```{r}
-hour_delay_tbl <- flights_train |>
+hour_delay_tbl <- train |>
   filter(!is.na(dep_del15), !is.na(sched_dep_hour)) |>
   group_by(sched_dep_hour) |>
   summarise(
@@ -226,7 +226,7 @@ Delay rates rise steadily over the course of the day and are highest in the even
 ## Carrier-by-Hour Interaction
 
 ```{r}
-carrier_hour_tbl <- flights_train |>
+carrier_hour_tbl <- train |>
   filter(!is.na(dep_del15), !is.na(sched_dep_hour)) |>
   group_by(op_unique_carrier, sched_dep_hour) |>
   summarise(
@@ -262,7 +262,7 @@ The carrier effect is not the same at every hour. Some carriers remain fairly st
 
 ```{r}
 # Delay rate by month
-flights_train |>
+train |>
   filter(!is.na(dep_del15)) |>
   group_by(month) |>
   summarise(
@@ -283,7 +283,7 @@ flights_train |>
 
 ```{r}
 # Delay rate by day of week
-flights_train |>
+train |>
   filter(!is.na(dep_del15)) |>
   group_by(day_of_week) |>
   summarise(
@@ -304,7 +304,7 @@ flights_train |>
 
 ```{r}
 # Delay rate by calendar date, aligned to a common year for display
-flights_train |>
+train |>
   filter(!is.na(dep_del15)) |>
   mutate(plot_date = make_date(year = 2010, month = as.integer(as.character(month)), day = day_of_month)) |>
   group_by(plot_date) |>
@@ -329,12 +329,12 @@ Delays are worse in the summer months and in December, which is consistent with 
 ## Destination and Distance Effects
 
 ```{r}
-top_dests <- flights_train |>
+top_dests <- train |>
   count(dest, sort = TRUE) |>
   slice_head(n = 15) |>
   pull(dest)
 
-flights_train |>
+train |>
   filter(!is.na(dep_del15), dest %in% top_dests) |>
   group_by(dest) |>
   summarise(
@@ -356,7 +356,7 @@ flights_train |>
 ```
 
 ```{r}
-flights_train <- flights_train |>
+train <- train |>
   mutate(
     distance_bucket = case_when(
       distance > 600 ~ ">600",
@@ -369,7 +369,7 @@ flights_train <- flights_train |>
     )
   )
 
-flights_train |>
+train |>
   filter(!is.na(dep_del15), !is.na(distance_bucket)) |>
   group_by(distance_bucket) |>
   summarise(
@@ -393,7 +393,7 @@ Delay rates differ across destinations, even among the busiest PIT routes, which
 ## High-Delay Days
 
 ```{r}
-bad_days_tbl <- flights_train |>
+bad_days_tbl <- train |>
   filter(!is.na(dep_del15)) |>
   group_by(fl_date) |>
   summarise(
@@ -442,9 +442,9 @@ add_basic_features <- function(df) {
     )
 }
 
-flights_train <- add_basic_features(flights_train)
-flights_test_visible <- add_basic_features(flights_test_visible)
-flights_test_guess <- add_basic_features(flights_test_guess)
+train <- add_basic_features(train)
+test_visible <- add_basic_features(test_visible)
+test_guess <- add_basic_features(test_guess)
 ```
 
 These features directly reflect the strongest patterns from the EDA. In particular, `peak_season`, the morning and evening indicators, the distance bucket, and the carrier-by-hour combination all transform observed structure in the data into modeling variables.
@@ -452,7 +452,7 @@ These features directly reflect the strongest patterns from the EDA. In particul
 ## Build Smoothed Historical Delay-Rate Features
 
 ```{r}
-global_delay_rate <- mean(flights_train$dep_del15, na.rm = TRUE)
+global_delay_rate <- mean(train$dep_del15, na.rm = TRUE)
 
 make_smoothed_rates <- function(df, group_var, target = "dep_del15", m = 100) {
   group_sym <- rlang::sym(group_var)
@@ -474,25 +474,25 @@ make_smoothed_rates <- function(df, group_var, target = "dep_del15", m = 100) {
 ```
 
 ```{r}
-carrier_rates <- make_smoothed_rates(flights_train, "op_unique_carrier", m = 200) |>
+carrier_rates <- make_smoothed_rates(train, "op_unique_carrier", m = 200) |>
   rename(
     carrier_delay_rate_smooth = smoothed_rate,
     carrier_n = n
   )
 
-dest_rates <- make_smoothed_rates(flights_train, "dest", m = 200) |>
+dest_rates <- make_smoothed_rates(train, "dest", m = 200) |>
   rename(
     dest_delay_rate_smooth = smoothed_rate,
     dest_n = n
   )
 
-carrier_hour_rates <- make_smoothed_rates(flights_train, "carrier_hour", m = 100) |>
+carrier_hour_rates <- make_smoothed_rates(train, "carrier_hour", m = 100) |>
   rename(
     carrier_hour_delay_rate_smooth = smoothed_rate,
     carrier_hour_n = n
   )
 
-flight_num_rates <- make_smoothed_rates(flights_train, "flights", m = 150) |>
+flight_num_rates <- make_smoothed_rates(train, "flights", m = 150) |>
   rename(
     flight_num_delay_rate_smooth = smoothed_rate,
     flight_num_n = n
@@ -518,9 +518,9 @@ apply_rate_features <- function(df) {
     )
 }
 
-flights_train_fe <- apply_rate_features(flights_train)
-flights_test_visible_fe <- apply_rate_features(flights_test_visible)
-flights_test_guess_fe <- apply_rate_features(flights_test_guess)
+train_fe <- apply_rate_features(train)
+test_visible_fe <- apply_rate_features(test_visible)
+test_guess_fe <- apply_rate_features(test_guess)
 ```
 
 All of these encodings are learned using the training data and then applied to the test sets. If a group in the test set was not seen in training, we fall back to the global delay rate.
@@ -533,36 +533,36 @@ add_running_day_features <- function(df) {
     arrange(fl_date, crs_dep_time) |>
     group_by(fl_date) |>
     mutate(
-      flights_before_today = row_number() - 1,
+      before_today = row_number() - 1,
       delays_before_today = lag(cumsum(replace_na(dep_del15, 0)), default = 0),
       prior_same_day_delay_rate = if_else(
-        flights_before_today > 0,
-        delays_before_today / flights_before_today,
+        before_today > 0,
+        delays_before_today / before_today,
         0
       )
     ) |>
     ungroup()
 }
 
-flights_train_fe <- add_running_day_features(flights_train_fe)
+train_fe <- add_running_day_features(train_fe)
 ```
 
 This feature captures how disrupted the system already is earlier in the day. It is especially useful because the prediction setup gives visibility into earlier flights on the same date.
 
 ```{r}
-test_visible_day_summary <- flights_test_visible_fe |>
+test_visible_day_summary <- test_visible_fe |>
   filter(!is.na(dep_del15)) |>
   group_by(fl_date) |>
   summarise(
-    visible_flights_count = n(),
+    visible_count = n(),
     visible_delay_rate = mean(dep_del15),
     .groups = "drop"
   )
 
-flights_test_guess_fe <- flights_test_guess_fe |>
+test_guess_fe <- test_guess_fe |>
   left_join(test_visible_day_summary, by = "fl_date") |>
   mutate(
-    visible_flights_count = coalesce(visible_flights_count, 0),
+    visible_count = coalesce(visible_count, 0),
     visible_delay_rate = coalesce(visible_delay_rate, global_delay_rate)
   )
 ```
@@ -572,7 +572,7 @@ For the guess set, we cannot directly use the unknown future labels. Instead, we
 ## Add Historical High-Disruption Calendar Signal
 
 ```{r}
-bad_day_lookup <- flights_train |>
+bad_day_lookup <- train |>
   filter(!is.na(dep_del15)) |>
   group_by(month, day_of_month) |>
   summarise(
@@ -587,13 +587,13 @@ bad_day_lookup <- flights_train |>
     )
   )
 
-flights_train_fe <- flights_train_fe |>
+train_fe <- train_fe |>
   left_join(bad_day_lookup, by = c("month", "day_of_month"))
 
-flights_test_visible_fe <- flights_test_visible_fe |>
+test_visible_fe <- test_visible_fe |>
   left_join(bad_day_lookup, by = c("month", "day_of_month"))
 
-flights_test_guess_fe <- flights_test_guess_fe |>
+test_guess_fe <- test_guess_fe |>
   left_join(bad_day_lookup, by = c("month", "day_of_month"))
 ```
 
@@ -619,16 +619,16 @@ model_vars <- c(
   "carrier_hour_delay_rate_smooth",
   "flight_num_delay_rate_smooth",
   "prior_same_day_delay_rate",
-  "flights_before_today",
+  "before_today",
   "avg_delay_rate_for_calendar_day",
   "high_disruption_calendar_day"
 )
 
-train_model_df <- flights_train_fe |>
+train_model_df <- train_fe |>
   select(any_of(model_vars)) |>
   filter(!is.na(dep_del15))
 
-test_guess_model_df <- flights_test_guess_fe |>
+test_guess_model_df <- test_guess_fe |>
   select(any_of(setdiff(model_vars, "dep_del15")))
 ```
 
@@ -664,7 +664,7 @@ enhanced_vars <- c(
   "high_disruption_calendar_day"
 )
 
-baseline_df <- flights_train_fe |>
+baseline_df <- train_fe |>
   filter(!is.na(dep_del15)) |>
   select(any_of(baseline_vars)) |>
   mutate(
@@ -673,7 +673,7 @@ baseline_df <- flights_train_fe |>
     row_id = row_number()
   )
 
-enhanced_df <- flights_train_fe |>
+enhanced_df <- train_fe |>
   filter(!is.na(dep_del15)) |>
   select(any_of(enhanced_vars)) |>
   mutate(
