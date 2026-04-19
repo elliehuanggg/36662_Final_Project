@@ -43,10 +43,12 @@ test <- read_csv(here("data", "flights2025.csv")) |>
  clean_names()
 
 test_visible <- read_csv(here("data", "flights2025_visible.csv")) |>
- clean_names()
+ clean_names() |>
+  mutate(data_year = 2025)
 
 test_guess <- read_csv(here("data", "flights2025_guess.csv")) |>
- clean_names()
+ clean_names() |>
+  mutate(data_year = 2025)
 
 # Build training set
 train <- bind_rows(
@@ -551,6 +553,8 @@ add_running_day_features <- function(df) {
 }
 
 train_fe <- add_running_day_features(train_fe)
+test_visible_fe <- add_running_day_features(test_visible_fe)
+test_guess_fe <- add_running_day_features(test_guess_fe)
 ```
 
 This feature captures how disrupted the system already is earlier in the day. It is especially useful because the prediction setup gives visibility into earlier flights on the same date.
@@ -634,8 +638,11 @@ train_model_df <- train_fe |>
  select(any_of(model_vars)) |>
  filter(!is.na(dep_del15))
 
+test_visible_model_df <- test_visible_fe |>
+ select(any_of(model_vars))
+
 test_guess_model_df <- test_guess_fe |>
- select(any_of(setdiff(model_vars, "dep_del15")))
+ select(any_of(model_vars))
 ```
 
 At this point, `train_model_df` contains the response and engineered predictors for model fitting, while `test_guess_model_df` contains the same predictors for the flights we need to score. The final feature set reflects the main conclusions from the EDA: time of day is a major driver, carrier, destination, route are important, and same-day disruption adds useful information.
@@ -1061,5 +1068,45 @@ auc_df |>
   select(model_name, accur_train_0.6, accur_test_0.6) |>
   arrange(desc(accur_test_0.6)) |>
   head(5)
+```
+
+
+# Results - 2025 Visible
+
+```{r}
+compute_vis_auc <- function(auc_df = NULL, y, prob, model_name){
+ auc <- roc(y, prob) |>
+ auc()
+ accuracy <- mean(y == (prob > 0.5), na.rm = T)
+ df <- data.frame(model_name, auc, accuracy)
+ if (is.null(auc_df)){
+ return (df)
+ } else{
+ return (rbind(auc_df, df))
+ }
+}
+```
+
+
+```{r}
+test_visible_fe <- test_visible_fe |>
+  filter(dest != "SDF")
+
+x_vis_test <- model.matrix(dep_del15 ~ ., test_visible_model_df)[, -1]
+preds_df <- data.frame(
+ , # ensure 0/1
+ ,
+ lasso = predict(cv_lasso, newx = x_vis_test, s = "lambda.min", type = "response") |> as.vector(),
+ xgboost = predict(xgb_model, dtest),
+ rf = predict(rf_model, newdata = test_visible_fe, type = "prob")[, "1"],
+ brf = predict(brf_model, newdata = test_visible_fe, type = "prob")[, "1"]
+)
+y_true = as.numeric(as.character(test_visible_fe$dep_del15))
+# log reg
+log_reg = predict(log_reg, type = "response", newdata = test_visible_fe)
+vis_auc <- compute_vis_auc(y = y_true, prob = log_reg, model_name = "Log Reg")
+# lasso
+x_vis_test <- model.matrix(dep_del15 ~ ., test_visible_model_df)[, -1]
+lasso = predict(cv_lasso, newx = x_vis_test, s = "lambda.min", type = "response") |> as.vector()
 ```
 
