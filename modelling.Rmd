@@ -615,8 +615,8 @@ This feature is meant to capture recurring calendar periods that tend to have hi
 model_vars <- c(
  "dep_del15",
  "sched_dep_hour",
- "op_unique_carrier",
- "dest",
+ #"op_unique_carrier",
+ #"dest",
  "distance",
  "distance_bucket",
  "month",
@@ -857,220 +857,6 @@ auc_df <- compute_auc(
 )
 ```
 
-
-## PCA
-
-```{r}
-remove_constant <- function(df) {
-  df[, apply(df, 2, function(x) sd(x, na.rm = TRUE) != 0)]
-}
-
-x_train <- model.matrix(dep_del15 ~ ., train_split)[, -1]
-x_test  <- model.matrix(dep_del15 ~ ., test_split)[, -1]
-
-# remove zero-variance columns based on TRAIN ONLY
-keep_cols <- apply(x_train, 2, function(x) sd(x, na.rm = TRUE) != 0)
-
-x_train <- x_train[, keep_cols]
-x_test  <- x_test[, keep_cols]
-
-x_train <- model.matrix(dep_del15 ~ ., train_split)[, -1]
-x_test  <- model.matrix(dep_del15 ~ ., test_split)[, -1]
-
-nzv <- nearZeroVar(x_train)
-
-x_train <- x_train[, -nzv]
-
-x_test  <- x_test[, -nzv]
-pca_model <- prcomp(x_train, center = TRUE, scale. = TRUE)
-# choose number of components (e.g., 95% variance)
-var_explained <- cumsum(pca_model$sdev^2 / sum(pca_model$sdev^2))
-k <- which(var_explained >= 0.95)[1]
-
-# transform data
-x_train_pca <- pca_model$x[, 1:k]
-x_test_pca  <- predict(pca_model, newdata = x_test)[, 1:k]
-```
-
-## Logistics Regression
-
-```{r}
-train_pca_df <- data.frame(dep_del15 = y_train, x_train_pca)
-test_pca_df  <- data.frame(dep_del15 = y_test, x_test_pca)
-
-log_reg_pca <- glm(dep_del15 ~ ., family = "binomial", data = train_pca_df)
-
-train_prob <- predict(log_reg_pca, type = "response", newdata = train_pca_df)
-test_prob  <- predict(log_reg_pca, type = "response", newdata = test_pca_df)
-
-auc_df <- compute_auc(
-  auc_df,
-  y_train, train_prob,
-  y_test, test_prob,
-  "Log Reg (PCA)"
-)
-```
-
-
-## LASSO
-
-```{r}
-cv_lasso_pca <- cv.glmnet(
-  x_train_pca, y_train,
-  family = "binomial",
-  alpha = 1
-)
-
-train_prob <- predict(cv_lasso_pca, x_train_pca, s = "lambda.min", type = "response") |> as.vector()
-test_prob  <- predict(cv_lasso_pca, x_test_pca,  s = "lambda.min", type = "response") |> as.vector()
-
-auc_df <- compute_auc(
-  auc_df,
-  y_train, train_prob,
-  y_test, test_prob,
-  "LASSO (PCA)"
-)
-```
-
-
-## XGBoost
-
-```{r}
-dtrain_pca <- xgb.DMatrix(data = x_train_pca, label = y_train)
-dtest_pca  <- xgb.DMatrix(data = x_test_pca,  label = y_test)
-
-xgb_model_pca <- xgb.train(
-  params = list(objective = "binary:logistic", eval_metric = "auc"),
-  data = dtrain_pca,
-  nrounds = 100,
-  verbose = 0
-)
-
-train_prob <- predict(xgb_model_pca, dtrain_pca)
-test_prob  <- predict(xgb_model_pca, dtest_pca)
-
-auc_df <- compute_auc(
-  auc_df,
-  y_train, train_prob,
-  y_test, test_prob,
-  "XGBoost (PCA)"
-)
-```
-
-
-## Random Forest
-
-```{r}
-train_pca_df$dep_del15 <- as.factor(train_pca_df$dep_del15)
-test_pca_df$dep_del15  <- as.factor(test_pca_df$dep_del15)
-
-rf_pca <- randomForest(dep_del15 ~ ., data = train_pca_df, ntree = 300)
-
-train_prob <- predict(rf_pca, train_pca_df, type = "prob")[, "1"]
-test_prob  <- predict(rf_pca, test_pca_df,  type = "prob")[, "1"]
-
-auc_df <- compute_auc(
-  auc_df,
-  y_train, train_prob,
-  y_test, test_prob,
-  "RF (PCA)"
-)
-```
-
-
-## Balanced Random Forest
-
-```{r}
-class_counts <- table(train_pca_df$dep_del15)
-class_weights <- as.numeric(sum(class_counts) / (length(class_counts) * class_counts))
-names(class_weights) <- names(class_counts)
-
-brf_pca <- randomForest(
-  dep_del15 ~ .,
-  data = train_pca_df,
-  ntree = 300,
-  classwt = class_weights
-)
-
-train_prob <- predict(brf_pca, train_pca_df, type = "prob")[, "1"]
-test_prob  <- predict(brf_pca, test_pca_df,  type = "prob")[, "1"]
-
-auc_df <- compute_auc(
-  auc_df,
-  y_train, train_prob,
-  y_test, test_prob,
-  "Balanced RF (PCA)"
-)
-```
-
-## Aggregate PCA Models
-
-```{r}
-preds_df_pca <- data.frame(
- y_true = as.numeric(as.character(test_split$dep_del15)), # ensure 0/1
- log_reg = predict(log_reg_pca, type = "response", newdata = test_pca_df),
- lasso = predict(cv_lasso_pca, newx = x_test_pca, s = "lambda.min", type = "response") |> as.vector(),
- xgboost = predict(xgb_model_pca, dtest_pca),
- rf = predict(rf_pca, newdata = test_pca_df, type = "prob")[, "1"],
- brf = predict(brf_pca, newdata = test_pca_df, type = "prob")[, "1"]
-)
-preds_df_pca$avg_prob <- rowMeans(preds_df_pca[, -1])  # exclude y_true
-auc_df <- compute_auc(
-  auc_df = auc_df,
-  train_y = preds_df_pca$y_true,   # using test as both (since ensemble built on test)
-  train_prob = preds_df_pca$avg_prob,
-  test_y = preds_df_pca$y_true,
-  test_prob = preds_df_pca$avg_prob,
-  model_name = "Ensemble (Avg Prob) - PCA"
-)
-```
-
-
-```{r}
-pred_class <- preds_df_pca[, -1] > 0.5  # TRUE/FALSE matrix
-
-# majority vote (at least half the models predict 1)
-preds_df_pca$majority_class <- as.numeric(rowMeans(pred_class) > 0.5)
-# use proportion of models voting "1" as probability
-preds_df_pca$majority_prob <- rowMeans(pred_class)
-auc_df <- compute_auc(
-  auc_df = auc_df,
-  train_y = preds_df_pca$y_true,
-  train_prob = preds_df_pca$majority_prob,
-  test_y = preds_df_pca$y_true,
-  test_prob = preds_df_pca$majority_prob,
-  model_name = "Ensemble (Majority Vote) - PCA"
-)
-```
-
-
-## Compare AUC
-
-```{r}
-# best models by AUC
-auc_df |>
-  select(model_name, auc_train, auc_test) |>
-  arrange(desc(auc_test)) |>
-  head(5)
-```
-
-```{r}
-# best models by accuracy (threshold = 0.5)
-auc_df |>
-  select(model_name, accur_train_0.5, accur_test_0.5) |>
-  arrange(desc(accur_test_0.5)) |>
-  head(5)
-```
-
-```{r}
-# best models by accuracy (threshold = 0.6)
-auc_df |>
-  select(model_name, accur_train_0.6, accur_test_0.6) |>
-  arrange(desc(accur_test_0.6)) |>
-  head(5)
-```
-
-
 # Results - 2025 Visible
 
 ```{r}
@@ -1089,24 +875,52 @@ compute_vis_auc <- function(auc_df = NULL, y, prob, model_name){
 
 
 ```{r}
-test_visible_fe <- test_visible_fe |>
-  filter(dest != "SDF")
-
-x_vis_test <- model.matrix(dep_del15 ~ ., test_visible_model_df)[, -1]
-preds_df <- data.frame(
- , # ensure 0/1
- ,
- lasso = predict(cv_lasso, newx = x_vis_test, s = "lambda.min", type = "response") |> as.vector(),
- xgboost = predict(xgb_model, dtest),
- rf = predict(rf_model, newdata = test_visible_fe, type = "prob")[, "1"],
- brf = predict(brf_model, newdata = test_visible_fe, type = "prob")[, "1"]
-)
-y_true = as.numeric(as.character(test_visible_fe$dep_del15))
+test_visible_model_df <- test_visible_model_df |>
+  filter(!is.na(dep_del15))
+y_true = as.numeric(as.character(test_visible_model_df$dep_del15))
 # log reg
-log_reg = predict(log_reg, type = "response", newdata = test_visible_fe)
-vis_auc <- compute_vis_auc(y = y_true, prob = log_reg, model_name = "Log Reg")
+log_reg_prob = predict(log_reg, type = "response", 
+                  newdata = test_visible_model_df)
+vis_auc <- compute_vis_auc(y = y_true, prob = log_reg_prob,
+                           model_name = "Log Reg")
 # lasso
 x_vis_test <- model.matrix(dep_del15 ~ ., test_visible_model_df)[, -1]
+y_vis <- test_visible_model_df$dep_del15
 lasso = predict(cv_lasso, newx = x_vis_test, s = "lambda.min", type = "response") |> as.vector()
+vis_auc <- vis_auc |>
+  compute_vis_auc(y = y_true, prob = lasso,
+                           model_name = "LASSO")
+# xgboost
+dtest <- xgb.DMatrix(data = x_vis_test, label = y_vis)
+xgboost = predict(xgb_model, dtest)
+vis_auc <- vis_auc |>
+  compute_vis_auc(y = y_true, prob = xgboost,
+                           model_name = "XGBoost")
+# RF
+rf = predict(rf_model, newdata = test_visible_model_df, type = "prob")[, "1"]
+vis_auc <- vis_auc |>
+  compute_vis_auc(y = y_true, prob = rf,
+                           model_name = "RF")
+# Balanced RF
+brf = predict(brf_model, newdata = test_visible_model_df, type = "prob")[, "1"]
+vis_auc <- vis_auc |>
+  compute_vis_auc(y = y_true, prob = brf,
+                           model_name = "Balanced RF")
+# Avg Prov
+avg_prob <- data.frame(log_reg_prob, lasso, xgboost, rf, brf) |>
+  rowMeans()
+vis_auc <- vis_auc |>
+  compute_vis_auc(y = y_true, prob = avg_prob,
+                           model_name = "Avg Prob")
+```
+
+```{r}
+vis_auc |>
+  arrange(desc(auc))
+```
+
+```{r}
+vis_auc |>
+  arrange(desc(accuracy))
 ```
 
