@@ -432,7 +432,7 @@ A small number of days have unusually high delay rates, which suggests that ther
 
 The EDA suggests that delay risk depends on a mix of stable historical tendencies and day-specific operating conditions. Based on those patterns, we engineer features that capture time-of-day effects, carrier and route history, route distance, seasonality, and same-day disruption.
 
-## Add Basic Modeling Features
+## Basic Features
 
 ```{r}
 add_basic_features <- function(df) {
@@ -457,7 +457,9 @@ test_guess <- add_basic_features(test_guess)
 
 These features directly reflect the strongest patterns from the EDA. In particular, `peak_season`, the morning and evening indicators, the distance bucket, and the carrier-by-hour combination all transform observed structure in the data into modeling variables.
 
-## Build Smoothed Historical Delay-Rate Features
+## Smoothed Historical Delay Rates
+
+Raw group means are noisy, especially for carriers and routes with few flights at PIT. We use James-Stein style shrinkage: each group's rate is a weighted blend of its observed mean and the global delay rate, with the weight determined by how many observations the group has. Groups with lots of data are trusted; groups with little data are pulled toward the global mean.
 
 ```{r}
 global_delay_rate <- mean(train$dep_del15, na.rm = TRUE)
@@ -482,60 +484,123 @@ make_smoothed_rates <- function(df, group_var, target = "dep_del15", m = 100) {
 ```
 
 ```{r}
+# Route = carrier + dest; more specific than either alone
+train <- train |> mutate(route = paste(op_unique_carrier, dest, sep = "_"))
+test_visible <- test_visible |> mutate(route = paste(op_unique_carrier, dest, sep = "_"))
+test_guess <- test_guess |> mutate(route = paste(op_unique_carrier, dest, sep = "_"))
+
+# Carrier and dest rates computed on full train — stable enough that leakage is minimal
 carrier_rates <- make_smoothed_rates(train, "op_unique_carrier", m = 200) |>
- rename(
- carrier_delay_rate_smooth = smoothed_rate,
- carrier_n = n
- )
+ rename(carrier_delay_rate_smooth = smoothed_rate, carrier_n = n)
 
 dest_rates <- make_smoothed_rates(train, "dest", m = 200) |>
- rename(
- dest_delay_rate_smooth = smoothed_rate,
- dest_n = n
- )
-
-carrier_hour_rates <- make_smoothed_rates(train, "carrier_hour", m = 100) |>
- rename(
- carrier_hour_delay_rate_smooth = smoothed_rate,
- carrier_hour_n = n
- )
-
-flight_num_rates <- make_smoothed_rates(train, "flights", m = 150) |>
- rename(
- flight_num_delay_rate_smooth = smoothed_rate,
- flight_num_n = n
- )
+ rename(dest_delay_rate_smooth = smoothed_rate, dest_n = n)
 ```
 
-Rather than using raw historical means, we shrink each group toward the global average when the number of observations is small. This makes the features more stable, especially for carriers, routes, or flight numbers that appear only a limited number of times at PIT.
+```{r}
+# Out-of-fold (OOF) encoding for fine-grained features
+# carrier_hour, route, and flight_num are granular enough that computing them on the full
+# training set leaks label info into val rows. OOF fixes this: each row's rate is computed
+# from the other 4 folds only. Test sets use full-train lookups since their labels are never seen.
+set.seed(42)
+n_folds <- 5
+fold_id <- sample(rep(1:n_folds, length.out = nrow(train)))
+
+make_oof_rates <- function(df, group_var, target = "dep_del15", m = 100) {
+  group_sym  <- rlang::sym(group_var)
+  target_sym <- rlang::sym(target)
+  out_col    <- paste0(group_var, "_oof_rate")
+  global     <- mean(df[[target]], na.rm = TRUE)
+
+  result <- numeric(nrow(df))
+  for (k in 1:n_folds) {
+    in_fold  <- which(fold_id == k)
+    out_fold <- which(fold_id != k)
+    lookup <- df[out_fold, ] |>
+      filter(!is.na(!!target_sym)) |>
+      group_by(!!group_sym) |>
+      summarise(n = n(), mean_t = mean(!!target_sym), .groups = "drop") |>
+      mutate(rate = (n * mean_t + m * global) / (n + m))
+    merged <- df[in_fold, ] |>
+      select(!!group_sym) |>
+      left_join(lookup |> select(!!group_sym, rate), by = group_var)
+    result[in_fold] <- coalesce(merged$rate, global)
+  }
+  result
+}
+
+train$carrier_hour_delay_rate_smooth     <- make_oof_rates(train, "carrier_hour",  m = 100)
+train$route_delay_rate_smooth            <- make_oof_rates(train, "route",         m = 150)
+train$flight_num_delay_rate_smooth       <- make_oof_rates(train, "flights",       m = 150)
+
+# Week-of-year rate replaces a raw calendar-day rate — only ~2 obs per calendar day
+# with 2 years of data, which is too noisy. Week of year gives ~14 obs per cell.
+train <- train |> mutate(week_of_year = as.character(week(fl_date)))
+test_visible <- test_visible |> mutate(week_of_year = as.character(week(fl_date)))
+test_guess   <- test_guess   |> mutate(week_of_year = as.character(week(fl_date)))
+train$week_delay_rate_smooth <- make_oof_rates(train, "week_of_year", m = 50)
+train$avg_delay_rate_for_calendar_day <- train$week_delay_rate_smooth  # kept for high_disruption derivation
+
+# Full-train lookups for test sets
+carrier_hour_rates <- make_smoothed_rates(train, "carrier_hour", m = 100) |>
+  rename(carrier_hour_delay_rate_smooth = smoothed_rate, carrier_hour_n = n)
+
+flight_num_rates <- make_smoothed_rates(train, "flights", m = 150) |>
+  rename(flight_num_delay_rate_smooth = smoothed_rate, flight_num_n = n)
+
+route_rates <- make_smoothed_rates(train, "route", m = 150) |>
+  rename(route_delay_rate_smooth = smoothed_rate, route_n = n)
+
+week_rates <- make_smoothed_rates(train, "week_of_year", m = 50) |>
+  rename(week_delay_rate_smooth = smoothed_rate, week_n = n)
+
+bad_day_lookup <- train |>
+  filter(!is.na(dep_del15)) |>
+  group_by(week_of_year) |>
+  summarise(avg_delay_rate_for_calendar_day = mean(dep_del15), .groups = "drop")
+```
 
 ## Apply Historical Features to Train and Test
 
 ```{r}
-apply_rate_features <- function(df) {
- df |>
- left_join(carrier_rates, by = "op_unique_carrier") |>
- left_join(dest_rates, by = "dest") |>
- left_join(carrier_hour_rates, by = "carrier_hour") |>
- left_join(flight_num_rates, by = "flights") |>
- mutate(
- carrier_delay_rate_smooth = coalesce(carrier_delay_rate_smooth, global_delay_rate),
- dest_delay_rate_smooth = coalesce(dest_delay_rate_smooth, global_delay_rate),
- carrier_hour_delay_rate_smooth = coalesce(carrier_hour_delay_rate_smooth, global_delay_rate),
- flight_num_delay_rate_smooth = coalesce(flight_num_delay_rate_smooth, global_delay_rate)
- )
+# Train rows get OOF-encoded rates (already attached above); only carrier/dest joined here.
+# Test rows get full-train lookups for all rate features.
+apply_rate_features <- function(df, is_train = FALSE) {
+  df <- df |>
+    left_join(carrier_rates, by = "op_unique_carrier") |>
+    left_join(dest_rates, by = "dest") |>
+    mutate(
+      carrier_delay_rate_smooth = coalesce(carrier_delay_rate_smooth, global_delay_rate),
+      dest_delay_rate_smooth    = coalesce(dest_delay_rate_smooth,    global_delay_rate)
+    )
+  if (!is_train) {
+    df <- df |>
+      left_join(carrier_hour_rates, by = "carrier_hour") |>
+      left_join(flight_num_rates,   by = "flights") |>
+      left_join(route_rates,        by = "route") |>
+      left_join(week_rates,         by = "week_of_year") |>
+      left_join(bad_day_lookup,     by = "week_of_year") |>
+      mutate(
+        carrier_hour_delay_rate_smooth  = coalesce(carrier_hour_delay_rate_smooth,  global_delay_rate),
+        flight_num_delay_rate_smooth    = coalesce(flight_num_delay_rate_smooth,    global_delay_rate),
+        route_delay_rate_smooth         = coalesce(route_delay_rate_smooth,         global_delay_rate),
+        week_delay_rate_smooth          = coalesce(week_delay_rate_smooth,          global_delay_rate),
+        avg_delay_rate_for_calendar_day = coalesce(avg_delay_rate_for_calendar_day, global_delay_rate)
+      )
+  }
+  df
 }
 
-train_fe <- apply_rate_features(train)
-test_visible_fe <- apply_rate_features(test_visible)
-test_guess_fe <- apply_rate_features(test_guess)
+train_fe        <- apply_rate_features(train,        is_train = TRUE)
+test_visible_fe <- apply_rate_features(test_visible, is_train = FALSE)
+test_guess_fe   <- apply_rate_features(test_guess,   is_train = FALSE)
 ```
 
-All of these encodings are learned using the training data and then applied to the test sets. If a group in the test set was not seen in training, we fall back to the global delay rate.
-
-## Add Running Same-Day Delay Features
+## Same-Day Disruption Features
 
 ```{r}
+# For each flight, count how many flights departed earlier that day and what fraction were delayed.
+# This captures real-time system disruption — if the morning has been chaotic, later flights will be too.
 add_running_day_features <- function(df) {
  df |>
  arrange(fl_date, crs_dep_time) |>
@@ -560,6 +625,8 @@ test_guess_fe <- add_running_day_features(test_guess_fe)
 This feature captures how disrupted the system already is earlier in the day. It is especially useful because the prediction setup gives visibility into earlier flights on the same date.
 
 ```{r}
+# For the guess flights, we can't observe their own labels, so we use summary stats
+# from the visible flights earlier that day as a proxy for same-day disruption.
 test_visible_day_summary <- test_visible_fe |>
  filter(!is.na(dep_del15)) |>
  group_by(fl_date) |>
@@ -579,59 +646,87 @@ test_guess_fe <- test_guess_fe |>
 
 For the guess set, we cannot directly use the unknown future labels. Instead, we summarize the flights that are already visible on that date and merge those day-level summaries into the flights we need to predict.
 
-## Add Historical High-Disruption Calendar Signal
+## Carrier and Destination Encodings
+
+Raw `op_unique_carrier` and `dest` factors can't go directly into the model because 2025 may contain carriers or destinations not seen in training, which would produce NA columns in the model matrix. Instead we use three stable encodings: a carrier size bucket (large/medium/small by flight count), a geographic region grouping for destinations, and a hub airport flag.
 
 ```{r}
-bad_day_lookup <- train |>
- filter(!is.na(dep_del15)) |>
- group_by(month, day_of_month) |>
- summarise(
- avg_delay_rate_for_calendar_day = mean(dep_del15),
- .groups = "drop"
- ) |>
- mutate(
- high_disruption_calendar_day = if_else(
- avg_delay_rate_for_calendar_day >= quantile(avg_delay_rate_for_calendar_day, 0.90),
- 1,
- 0
- )
- )
+# Carrier size by flight volume at PIT — unseen 2025 carriers default to "small"
+carrier_size <- train |>
+  count(op_unique_carrier) |>
+  mutate(carrier_size = case_when(
+    n >= 5000 ~ "large",
+    n >= 1000 ~ "medium",
+    TRUE      ~ "small"
+  )) |>
+  select(op_unique_carrier, carrier_size)
 
-train_fe <- train_fe |>
- left_join(bad_day_lookup, by = c("month", "day_of_month"))
+hub_airports <- c("ATL", "ORD", "DFW", "DEN", "CLT", "JFK", "LAX",
+                   "LGA", "EWR", "SFO", "SEA", "MIA", "BOS", "MSP", "DTW", "PHL")
 
-test_visible_fe <- test_visible_fe |>
- left_join(bad_day_lookup, by = c("month", "day_of_month"))
+# Regional grouping for destinations — stable across years, unseen airports default to "other"
+dest_region <- train |>
+  distinct(dest) |>
+  mutate(dest_region = case_when(
+    dest %in% c("BOS", "JFK", "LGA", "EWR", "PHL", "DCA", "IAD", "BWI") ~ "northeast",
+    dest %in% c("ATL", "CLT", "MIA", "TPA", "MCO", "RDU", "BNA", "MEM") ~ "south",
+    dest %in% c("ORD", "MDW", "DTW", "MSP", "CLE", "CMH", "IND", "MKE") ~ "midwest",
+    dest %in% c("DFW", "DAL", "IAH", "HOU", "MSY", "SAT", "AUS")        ~ "southwest",
+    dest %in% c("DEN", "SLC", "PHX", "LAS", "ABQ")                      ~ "mountain",
+    dest %in% c("LAX", "SFO", "SEA", "PDX", "SAN", "SJC", "OAK")       ~ "west",
+    TRUE ~ "other"
+  ))
 
-test_guess_fe <- test_guess_fe |>
- left_join(bad_day_lookup, by = c("month", "day_of_month"))
+add_carrier_dest_features <- function(df) {
+  df |>
+    left_join(carrier_size, by = "op_unique_carrier") |>
+    left_join(dest_region, by = "dest") |>
+    mutate(
+      carrier_size = coalesce(carrier_size, "small"),   # unseen carriers → small
+      dest_region  = coalesce(dest_region, "other"),    # unseen dests → other
+      is_hub_dest  = if_else(dest %in% hub_airports, 1L, 0L),
+      carrier_size = factor(carrier_size, levels = c("small", "medium", "large")),
+      dest_region  = factor(dest_region),
+      # derive binary flag from week rate (more stable than calendar-day rate)
+      high_disruption_calendar_day = if_else(
+        week_delay_rate_smooth >= quantile(week_delay_rate_smooth, 0.90, na.rm = TRUE),
+        1L, 0L
+      )
+    )
+}
+
+train_fe        <- add_carrier_dest_features(train_fe)
+test_visible_fe <- add_carrier_dest_features(test_visible_fe)
+test_guess_fe   <- add_carrier_dest_features(test_guess_fe)
 ```
-
-This feature is meant to capture recurring calendar periods that tend to have higher disruption, without adding a large number of very specific date indicators to the model.
 
 ## Final Modeling Data Frames
 
 ```{r}
 model_vars <- c(
- "dep_del15",
- "sched_dep_hour",
- #"op_unique_carrier",
- #"dest",
- "distance",
- "distance_bucket",
- "month",
- "day_of_week",
- "peak_season",
- "is_evening",
- "is_morning",
- "carrier_delay_rate_smooth",
- "dest_delay_rate_smooth",
- "carrier_hour_delay_rate_smooth",
- "flight_num_delay_rate_smooth",
- "prior_same_day_delay_rate",
- "before_today",
- "avg_delay_rate_for_calendar_day",
- "high_disruption_calendar_day"
+  "dep_del15",
+  "sched_dep_hour",
+  "carrier_size",
+  "dest_region",
+  "is_hub_dest",
+  "distance",
+  "distance_bucket",
+  "month",
+  "day_of_week",
+  "peak_season",
+  "is_evening",
+  "is_morning",
+  "carrier_delay_rate_smooth",
+  "dest_delay_rate_smooth",
+  # carrier_hour_delay_rate_smooth removed — redundant given carrier_rate + sched_dep_hour,
+  # and too granular to encode reliably even with OOF (dominated feature importance pathologically)
+  "flight_num_delay_rate_smooth",
+  "route_delay_rate_smooth",
+  "prior_same_day_delay_rate",
+  "before_today",
+  "visible_delay_rate",
+  "week_delay_rate_smooth",        # replaces avg_delay_rate_for_calendar_day (too noisy: ~2 obs/cell)
+  "high_disruption_calendar_day"
 )
 
 train_model_df <- train_fe |>
@@ -649,204 +744,391 @@ At this point, `train_model_df` contains the response and engineered predictors 
 
 # Modelling
 
-```{r}
-set.seed(100)
-n <- nrow(train_model_df)
-train_idx <- sample(1:n, size = 0.8 * n)
-train_split <- train_model_df[train_idx, ]
-test_split <- train_model_df[-train_idx, ]
-```
+## Setup
 
 ```{r}
-compute_auc <- function(auc_df = NULL, train_y, train_prob,
-                        test_y, test_prob, model_name){
- auc_train <- roc(train_y, train_prob) |>
- auc()
- auc_test <- roc(test_y, test_prob) |>
- auc()
- accur_train_0.5 <- mean(train_y == (train_prob > 0.5))
- accur_test_0.5 <- mean(train_y == (test_prob > 0.5))
- accur_train_0.6 <- mean(train_y == (train_prob > 0.6))
- accur_test_0.6 <- mean(train_y == (test_prob > 0.6))
- df <- data.frame(model_name, auc_train, auc_test,
-                  accur_train_0.5, accur_test_0.5,
-                  accur_train_0.6, accur_test_0.6)
- if (is.null(auc_df)){
- return (df)
- } else{
- return (rbind(auc_df, df))
- }
+# Helper to align model matrices between train and test so factor levels always match.
+# Adds zero columns for any level in train not seen in test, drops extras.
+make_aligned_matrix <- function(formula, train_df, test_df) {
+  x_train <- model.matrix(formula, data = train_df)[, -1, drop = FALSE]
+  x_test  <- model.matrix(formula, data = test_df)[, -1, drop = FALSE]
+
+  missing_cols <- setdiff(colnames(x_train), colnames(x_test))
+  if (length(missing_cols) > 0) {
+    for (col in missing_cols) {
+      x_test <- cbind(x_test, 0)
+      colnames(x_test)[ncol(x_test)] <- col
+    }
+  }
+
+  extra_cols <- setdiff(colnames(x_test), colnames(x_train))
+  if (length(extra_cols) > 0) {
+    x_test <- x_test[, !(colnames(x_test) %in% extra_cols), drop = FALSE]
+  }
+
+  x_test <- x_test[, colnames(x_train), drop = FALSE]
+
+  list(
+    x_train = x_train,
+    x_test = x_test
+  )
 }
 ```
 
+```{r}
+# Helper to align factor levels between a new data frame and the training split.
+# Needed for randomForest which requires the same factor levels at predict time.
+align_to_training <- function(new_df, train_df) {
+  common_cols <- intersect(names(train_df), names(new_df))
+
+  for (col in common_cols) {
+    # align factor columns
+    if (is.factor(train_df[[col]])) {
+      new_df[[col]] <- factor(as.character(new_df[[col]]),
+                              levels = levels(train_df[[col]]))
+    }
+
+    # align numeric/integer columns
+    if (is.numeric(train_df[[col]]) && !is.numeric(new_df[[col]])) {
+      new_df[[col]] <- as.numeric(new_df[[col]])
+    }
+
+    if (is.integer(train_df[[col]]) && !is.integer(new_df[[col]])) {
+      new_df[[col]] <- as.integer(new_df[[col]])
+    }
+  }
+
+  new_df
+}
+```
+
+```{r}
+# 80/20 train/val split for internal model evaluation
+set.seed(100)
+
+n <- nrow(train_model_df)
+train_idx <- sample(1:n, size = 0.8 * n)
+
+train_split <- train_model_df[train_idx, ]
+test_split  <- train_model_df[-train_idx, ]
+```
+
+```{r}
+# AUC and accuracy tracker — appends one row per model
+compute_auc <- function(auc_df = NULL, train_y, train_prob,
+                        test_y, test_prob, model_name) {
+  auc_train <- roc(train_y, train_prob) |> auc()
+  auc_test <- roc(test_y,  test_prob)  |> auc()
+
+  accur_train_0.5 <- mean(train_y == (train_prob > 0.5))
+  accur_test_0.5 <- mean(test_y  == (test_prob  > 0.5))
+
+  accur_train_0.6 <- mean(train_y == (train_prob > 0.6))
+  accur_test_0.6 <- mean(test_y  == (test_prob  > 0.6))
+
+  df <- data.frame(
+    model_name,
+    auc_train,
+    auc_test,
+    accur_train_0.5,
+    accur_test_0.5,
+    accur_train_0.6,
+    accur_test_0.6
+  )
+
+  if (is.null(auc_df)) {
+    return(df)
+  } else {
+    return(rbind(auc_df, df))
+  }
+}
+```
+
+```{r}
+y_train <- train_split$dep_del15
+y_test  <- test_split$dep_del15
+
+# Linear model matrix: poly(sched_dep_hour, 2) lets logistic/LASSO capture the curved hour effect
+lm_mats <- make_aligned_matrix(
+  dep_del15 ~ . + poly(sched_dep_hour, 2),
+  train_split,
+  test_split
+)
+
+x_train_lm <- lm_mats$x_train
+x_test_lm <- lm_mats$x_test
+
+# XGBoost matrix: raw features only — XGBoost finds nonlinearity through splits, not poly terms
+xgb_mats <- make_aligned_matrix(
+  dep_del15 ~ .,
+  train_split,
+  test_split
+)
+
+x_train_xgb <- xgb_mats$x_train
+x_test_xgb <- xgb_mats$x_test
+
+# Full-train matrix used for XGBoost CV tuning (avoids overfitting to the 80/20 split)
+x_full_xgb <- model.matrix(dep_del15 ~ ., data = train_model_df)[, -1, drop = FALSE]
+y_full <- train_model_df$dep_del15
+```
 
 ## Logistic Regression
 
 ```{r}
-# fit model
-log_reg <- glm(dep_del15~., family = 'binomial', data = train_split)
-# get prob
-train_prob <- predict(log_reg, type = "response", 
- newdata = train_split)
-test_prob <- predict(log_reg, type = "response", 
- newdata = test_split)
-# get AUC
-auc_df <- compute_auc(train_y = train_split$dep_del15, 
- train_prob = train_prob,
- test_y = test_split$dep_del15,
- test_prob = test_prob,
- model_name = "Log Reg")
-```
+log_reg <- glm(
+  dep_del15 ~ . + poly(sched_dep_hour, 2),
+  family = "binomial",
+  data = train_split
+)
 
+train_prob <- predict(log_reg, type = "response", newdata = train_split)
+test_prob  <- predict(log_reg, type = "response", newdata = test_split)
+
+auc_df <- compute_auc(
+  train_y = train_split$dep_del15,
+  train_prob = train_prob,
+  test_y = test_split$dep_del15,
+  test_prob = test_prob,
+  model_name = "Log Reg"
+)
+```
 
 ## LASSO
 
 ```{r}
-# prep data for glmnet
-x_train <- model.matrix(dep_del15 ~ ., train_split)[, -1]
-y_train <- train_split$dep_del15
-x_test <- model.matrix(dep_del15 ~ ., test_split)[, -1]
-y_test <- test_split$dep_del15
-
 cv_lasso <- cv.glmnet(
- x_train, y_train,
- family = "binomial",
- alpha = 1
+  x_train_lm,
+  y_train,
+  family = "binomial",
+  alpha = 1
 )
 
-train_prob <- predict(cv_lasso, newx = x_train,
- s = "lambda.min", type = "response") |>
- as.vector()
+train_prob <- predict(
+  cv_lasso,
+  newx = x_train_lm,
+  s = "lambda.min",
+  type = "response"
+) |>
+  as.vector()
 
-test_prob <- predict(cv_lasso, newx = x_test,
- s = "lambda.min", type = "response") |>
- as.vector()
+test_prob <- predict(
+  cv_lasso,
+  newx = x_test_lm,
+  s = "lambda.min",
+  type = "response"
+) |>
+  as.vector()
+
 auc_df <- compute_auc(
- auc_df = auc_df,
- train_y = y_train,
- train_prob = train_prob,
- test_y = y_test,
- test_prob = test_prob,
- model_name = "Log Reg (LASSO)"
+  auc_df = auc_df,
+  train_y = y_train,
+  train_prob = train_prob,
+  test_y = y_test,
+  test_prob = test_prob,
+  model_name = "Log Reg (LASSO)"
 )
 ```
 
+## XGBoost (tuned)
 
-## XGBoost
+XGBoost with default params and 100 rounds leaves a lot of AUC on the table. We tune
+the key parameters via cross-validation: `max_depth` controls tree complexity, `eta`
+controls shrinkage, and `subsample`/`colsample_bytree` add randomization to reduce
+overfitting. `nrounds` is selected by early stopping on the CV AUC curve.
 
 ```{r}
-# prep data for xgboost
-dtrain <- xgb.DMatrix(data = x_train, label = y_train)
-dtest <- xgb.DMatrix(data = x_test, label = y_test)
-# xgboost
-params <- list(
- objective = "binary:logistic",
- eval_metric = "auc"
+dtrain <- xgb.DMatrix(data = x_train_xgb, label = y_train)
+dtest  <- xgb.DMatrix(data = x_test_xgb, label = y_test)
+dfull  <- xgb.DMatrix(data = x_full_xgb, label = y_full)
+
+xgb_grid <- expand.grid(
+  max_depth        = c(3, 4, 5),
+  eta              = c(0.05, 0.1),
+  subsample        = c(0.7, 0.9),
+  colsample_bytree = c(0.7, 0.9),
+  min_child_weight = c(10, 30),
+  gamma            = c(0, 1)
 )
+
+best_auc     <- 0
+best_params  <- NULL
+best_nrounds <- 100
+
+for (i in seq_len(nrow(xgb_grid))) {
+  params_i <- list(
+    objective        = "binary:logistic",
+    eval_metric      = "auc",
+    max_depth        = xgb_grid$max_depth[i],
+    eta              = xgb_grid$eta[i],
+    subsample        = xgb_grid$subsample[i],
+    colsample_bytree = xgb_grid$colsample_bytree[i],
+    min_child_weight = xgb_grid$min_child_weight[i],
+    gamma            = xgb_grid$gamma[i]
+  )
+
+  cv_result <- xgb.cv(
+    params = params_i,
+    data = dfull,
+    nrounds = 500,
+    nfold = 5,
+    early_stopping_rounds = 30,
+    verbose = 0
+  )
+
+  nrounds_i <- cv_result$best_iteration
+  if (is.null(nrounds_i) || length(nrounds_i) == 0) {
+    nrounds_i <- which.max(cv_result$evaluation_log$test_auc_mean)
+  }
+
+  best_i <- cv_result$evaluation_log$test_auc_mean[nrounds_i]
+
+  if (best_i > best_auc) {
+    best_auc     <- best_i
+    best_params  <- params_i
+    best_nrounds <- nrounds_i
+  }
+}
+
+cat("Best CV AUC:", round(best_auc, 4), "| nrounds:", best_nrounds, "\n")
 
 xgb_model <- xgb.train(
- params = params,
- data = dtrain,
- nrounds = 100,
- verbose = 0
+  params = best_params,
+  data = dfull,
+  nrounds = best_nrounds,
+  verbose = 0
 )
+
 train_prob <- predict(xgb_model, dtrain)
-test_prob <- predict(xgb_model, dtest)
+test_prob  <- predict(xgb_model, dtest)
+
 auc_df <- compute_auc(
- auc_df = auc_df,
- train_y = y_train,
- train_prob = train_prob,
- test_y = y_test,
- test_prob = test_prob,
- model_name = "XGBoost"
+  auc_df = auc_df,
+  train_y = y_train,
+  train_prob = train_prob,
+  test_y = y_test,
+  test_prob = test_prob,
+  model_name = "XGBoost (tuned)"
 )
 ```
-
 
 ## Random Forest
 
 ```{r}
-train_split$dep_del15 <- as.factor(train_split$dep_del15)
-test_split$dep_del15 <- as.factor(test_split$dep_del15)
+train_split_rf <- train_split |>
+  mutate(dep_del15 = as.factor(dep_del15))
+
+test_split_rf <- test_split |>
+  mutate(dep_del15 = as.factor(dep_del15))
 
 rf_model <- randomForest(
- dep_del15 ~ .,
- data = train_split,
- ntree = 300, # number of trees
- importance = TRUE
+  dep_del15 ~ .,
+  data = train_split_rf,
+  ntree = 300,
+  importance = TRUE
 )
 
-train_prob <- predict(rf_model, newdata = train_split, type = "prob")[, "1"]
-test_prob <- predict(rf_model, newdata = test_split, type = "prob")[, "1"]
+train_prob <- predict(rf_model, newdata = train_split_rf, type = "prob")[, "1"]
+
+test_split_rf_aligned <- align_to_training(test_split_rf, train_split_rf)
+
+test_prob <- predict(rf_model, newdata = test_split_rf_aligned, type = "prob")[, "1"]
 
 auc_df <- compute_auc(
- auc_df = auc_df,
- train_y = y_train,
- train_prob = train_prob,
- test_y = y_test,
- test_prob = test_prob,
- model_name = "Random Forest"
+  auc_df = auc_df,
+  train_y = y_train,
+  train_prob = train_prob,
+  test_y = y_test,
+  test_prob = test_prob,
+  model_name = "Random Forest"
 )
 ```
-
 
 ## Balanced Random Forest
 
 ```{r}
-# class weights
-class_counts <- table(train_split$dep_del15)
+# Upweight the minority (delayed) class to counteract the 80/20 imbalance
+class_counts <- table(train_split_rf$dep_del15)
 
-class_weights <- as.numeric(sum(class_counts) / (length(class_counts) * class_counts))
+class_weights <- as.numeric(
+  sum(class_counts) / (length(class_counts) * class_counts)
+)
 names(class_weights) <- names(class_counts)
 
 brf_model <- randomForest(
- dep_del15 ~ .,
- data = train_split,
- ntree = 300,
- classwt = class_weights
+  dep_del15 ~ .,
+  data = train_split_rf,
+  ntree = 300,
+  classwt = class_weights
 )
-train_prob <- predict(brf_model, newdata = train_split, type = "prob")[, "1"]
-test_prob <- predict(brf_model, newdata = test_split, type = "prob")[, "1"]
+
+train_prob <- predict(brf_model, newdata = train_split_rf, type = "prob")[, "1"]
+
+test_split_rf_aligned <- align_to_training(test_split_rf, train_split_rf)
+
+test_prob <- predict(brf_model, newdata = test_split_rf_aligned, type = "prob")[, "1"]
+
 auc_df <- compute_auc(
- auc_df = auc_df,
- train_y = y_train,
- train_prob = train_prob,
- test_y = y_test,
- test_prob = test_prob,
- model_name = "Balanced RF"
+  auc_df = auc_df,
+  train_y = y_train,
+  train_prob = train_prob,
+  test_y = y_test,
+  test_prob = test_prob,
+  model_name = "Balanced RF"
 )
 ```
 
-## Aggregate All Models
+## Ensembles
+
+Simple averaging across all models dilutes the best performers. We compare: (1) the naive
+average, (2) a weighted average that upweights XGBoost, which typically dominates on
+tabular data, and (3) majority vote.
 
 ```{r}
 preds_df <- data.frame(
- y_true = as.numeric(as.character(test_split$dep_del15)), # ensure 0/1
- log_reg = predict(log_reg, type = "response", newdata = test_split),
- lasso = predict(cv_lasso, newx = x_test, s = "lambda.min", type = "response") |> as.vector(),
- xgboost = predict(xgb_model, dtest),
- rf = predict(rf_model, newdata = test_split, type = "prob")[, "1"],
- brf = predict(brf_model, newdata = test_split, type = "prob")[, "1"]
+  y_true = as.numeric(as.character(test_split$dep_del15)),
+  log_reg = predict(log_reg, type = "response", newdata = test_split),
+  lasso = predict(cv_lasso, newx = x_test_lm, s = "lambda.min", type = "response") |> as.vector(),
+  xgboost = predict(xgb_model, dtest),
+  rf = predict(rf_model,  newdata = test_split_rf, type = "prob")[, "1"],
+  brf = predict(brf_model, newdata = test_split_rf, type = "prob")[, "1"]
 )
-preds_df$avg_prob <- rowMeans(preds_df[, -1])  # exclude y_true
+
+# Simple average
+preds_df$avg_prob <- rowMeans(preds_df[, c("log_reg", "lasso", "xgboost", "rf", "brf")])
+
 auc_df <- compute_auc(
   auc_df = auc_df,
-  train_y = preds_df$y_true,   # using test as both (since ensemble built on test)
+  train_y = preds_df$y_true,
   train_prob = preds_df$avg_prob,
   test_y = preds_df$y_true,
   test_prob = preds_df$avg_prob,
-  model_name = "Ensemble (Avg Prob)"
+  model_name = "Ensemble (Avg)"
 )
-```
 
+# Weighted average: XGBoost gets more weight since it's the strongest model on this data
+preds_df$weighted_prob <- with(
+  preds_df,
+  0.50 * xgboost +
+    0.15 * rf +
+    0.10 * brf +
+    0.15 * lasso +
+    0.10 * log_reg
+)
 
-```{r}
-pred_class <- preds_df[, -1] > 0.5  # TRUE/FALSE matrix
+auc_df <- compute_auc(
+  auc_df = auc_df,
+  train_y = preds_df$y_true,
+  train_prob = preds_df$weighted_prob,
+  test_y = preds_df$y_true,
+  test_prob = preds_df$weighted_prob,
+  model_name = "Ensemble (Weighted)"
+)
 
-# majority vote (at least half the models predict 1)
-preds_df$majority_class <- as.numeric(rowMeans(pred_class) > 0.5)
-# use proportion of models voting "1" as probability
+# Majority vote
+pred_class <- preds_df[, c("log_reg", "lasso", "xgboost", "rf", "brf")] > 0.5
 preds_df$majority_prob <- rowMeans(pred_class)
+
 auc_df <- compute_auc(
   auc_df = auc_df,
   train_y = preds_df$y_true,
@@ -860,67 +1142,145 @@ auc_df <- compute_auc(
 # Results - 2025 Visible
 
 ```{r}
-compute_vis_auc <- function(auc_df = NULL, y, prob, model_name){
- auc <- roc(y, prob) |>
- auc()
- accuracy <- mean(y == (prob > 0.5), na.rm = T)
- df <- data.frame(model_name, auc, accuracy)
- if (is.null(auc_df)){
- return (df)
- } else{
- return (rbind(auc_df, df))
- }
+# AUC and accuracy on the 2025 visible set (the portion of test data where we know the true labels)
+compute_vis_auc <- function(auc_df = NULL, y, prob, model_name) {
+  auc <- roc(y, prob) |> auc()
+  accuracy <- mean(y == (prob > 0.5), na.rm = TRUE)
+
+  df <- data.frame(model_name, auc, accuracy)
+
+  if (is.null(auc_df)) {
+    return(df)
+  } else {
+    return(rbind(auc_df, df))
+  }
 }
 ```
 
-
 ```{r}
-test_visible_model_df <- test_visible_model_df |>
+test_visible_model_df_eval <- test_visible_model_df |>
   filter(!is.na(dep_del15))
-y_true = as.numeric(as.character(test_visible_model_df$dep_del15))
-# log reg
-log_reg_prob = predict(log_reg, type = "response", 
-                  newdata = test_visible_model_df)
-vis_auc <- compute_vis_auc(y = y_true, prob = log_reg_prob,
-                           model_name = "Log Reg")
-# lasso
-x_vis_test <- model.matrix(dep_del15 ~ ., test_visible_model_df)[, -1]
-y_vis <- test_visible_model_df$dep_del15
-lasso = predict(cv_lasso, newx = x_vis_test, s = "lambda.min", type = "response") |> as.vector()
-vis_auc <- vis_auc |>
-  compute_vis_auc(y = y_true, prob = lasso,
-                           model_name = "LASSO")
-# xgboost
-dtest <- xgb.DMatrix(data = x_vis_test, label = y_vis)
-xgboost = predict(xgb_model, dtest)
-vis_auc <- vis_auc |>
-  compute_vis_auc(y = y_true, prob = xgboost,
-                           model_name = "XGBoost")
-# RF
-rf = predict(rf_model, newdata = test_visible_model_df, type = "prob")[, "1"]
-vis_auc <- vis_auc |>
-  compute_vis_auc(y = y_true, prob = rf,
-                           model_name = "RF")
-# Balanced RF
-brf = predict(brf_model, newdata = test_visible_model_df, type = "prob")[, "1"]
-vis_auc <- vis_auc |>
-  compute_vis_auc(y = y_true, prob = brf,
-                           model_name = "Balanced RF")
-# Avg Prov
-avg_prob <- data.frame(log_reg_prob, lasso, xgboost, rf, brf) |>
-  rowMeans()
-vis_auc <- vis_auc |>
-  compute_vis_auc(y = y_true, prob = avg_prob,
-                           model_name = "Avg Prob")
+
+y_true <- as.numeric(as.character(test_visible_model_df_eval$dep_del15))
+y_vis <- test_visible_model_df_eval$dep_del15
+
+# Build aligned matrices using the original training split as the reference
+vis_lm_mats <- make_aligned_matrix(
+  dep_del15 ~ . + poly(sched_dep_hour, 2),
+  train_split,
+  test_visible_model_df_eval
+)
+
+x_vis_lm <- vis_lm_mats$x_test
+
+vis_xgb_mats <- make_aligned_matrix(
+  dep_del15 ~ .,
+  train_split,
+  test_visible_model_df_eval
+)
+
+x_vis_xgb <- vis_xgb_mats$x_test
+dvis <- xgb.DMatrix(data = x_vis_xgb, label = y_vis)
+
+# Logistic / lasso / xgboost probabilities
+log_reg_prob <- predict(log_reg, type = "response", newdata = test_visible_model_df_eval)
+
+lasso_prob <- predict(
+  cv_lasso,
+  newx = x_vis_lm,
+  s = "lambda.min",
+  type = "response"
+) |>
+  as.vector()
+
+xgb_prob <- predict(xgb_model, dvis)
+
+# RF-compatible visible data (factor levels must match training)
+test_visible_rf <- test_visible_model_df_eval |>
+  mutate(dep_del15 = as.factor(dep_del15))
+
+test_visible_rf <- align_to_training(test_visible_rf, train_split_rf)
+
+rf_prob <- predict(
+  rf_model,
+  newdata = test_visible_rf,
+  type = "prob"
+)[, "1"]
+
+brf_prob <- predict(
+  brf_model,
+  newdata = test_visible_rf,
+  type = "prob"
+)[, "1"]
+
+avg_prob <- rowMeans(data.frame(log_reg_prob, lasso_prob, xgb_prob, rf_prob, brf_prob))
+
+weighted_prob <- 0.50 * xgb_prob +
+  0.15 * rf_prob +
+  0.10 * brf_prob +
+  0.15 * lasso_prob +
+  0.10 * log_reg_prob
+
+vis_auc <- compute_vis_auc(
+  y = y_true,
+  prob = log_reg_prob,
+  model_name = "Log Reg"
+)
+
+vis_auc <- compute_vis_auc(
+  vis_auc,
+  y = y_true,
+  prob = lasso_prob,
+  model_name = "LASSO"
+)
+
+vis_auc <- compute_vis_auc(
+  vis_auc,
+  y = y_true,
+  prob = xgb_prob,
+  model_name = "XGBoost (tuned)"
+)
+
+vis_auc <- compute_vis_auc(
+  vis_auc,
+  y = y_true,
+  prob = rf_prob,
+  model_name = "RF"
+)
+
+vis_auc <- compute_vis_auc(
+  vis_auc,
+  y = y_true,
+  prob = brf_prob,
+  model_name = "Balanced RF"
+)
+
+vis_auc <- compute_vis_auc(
+  vis_auc,
+  y = y_true,
+  prob = avg_prob,
+  model_name = "Ensemble (Avg)"
+)
+
+vis_auc <- compute_vis_auc(
+  vis_auc,
+  y = y_true,
+  prob = weighted_prob,
+  model_name = "Ensemble (Weighted)"
+)
 ```
 
 ```{r}
-vis_auc |>
-  arrange(desc(auc))
+vis_auc |> arrange(desc(auc))
 ```
 
 ```{r}
-vis_auc |>
-  arrange(desc(accuracy))
+vis_auc |> arrange(desc(accuracy))
 ```
 
+## XGBoost Feature Importance
+
+```{r}
+xgb.importance(model = xgb_model) |>
+  xgb.plot.importance(top_n = 15, main = "XGBoost feature importance (top 15)")
+```

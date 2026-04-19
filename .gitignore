@@ -1,1 +1,13 @@
+.RData
+.Rhistory
 .Rproj.user/
+*.Rproj
+
+modelling_cache/
+*_cache/
+
+modelling_files/
+models/
+
+*.pdf
+.DS_Store
