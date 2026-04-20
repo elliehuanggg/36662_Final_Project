@@ -61,7 +61,6 @@ train <- bind_rows(
 
 ```{r}
 # Apply the same cleaning steps to each data frame so train and test sets are consistent
-# Apply the same cleaning steps to each data frame so train and test sets are consistent
 clean_flights <- function(df) {
  df |>
  clean_names() |>
@@ -82,54 +81,88 @@ train <- clean_flights(train)
 test <- clean_flights(test)
 test_visible <- clean_flights(test_visible)
 test_guess <- clean_flights(test_guess)
+```
 
+```{r}
 # Restrict to departures from PIT
 train <- train |>
-  filter(origin == "PIT")
-
-test <- test |>
-  filter(origin == "PIT")
+ filter(origin == "PIT")
 
 test_visible <- test_visible |>
-  filter(origin == "PIT")
+ filter(origin == "PIT")
 
 test_guess <- test_guess |>
-  filter(origin == "PIT")
+ filter(origin == "PIT")
 
-# Stable row key for joining full 2025 schedule features back to visible/guess subsets
-make_flight_key <- function(df) {
-  df |>
-    mutate(
-      flight_key = paste(
-        fl_date,
-        op_unique_carrier,
-        dest,
-        crs_dep_time,
-        flights,
-        sep = "__"
-      )
-    )
-}
-
-train <- make_flight_key(train)
-test <- make_flight_key(test)
-test_visible <- make_flight_key(test_visible)
-test_guess <- make_flight_key(test_guess)
-
-# Quick check of target distribution
+# Quick check of the target distribution
 table(train$dep_del15, useNA = "ifany")
 ```
 
-We focus on Pittsburgh departures because that is the airport represented in the prediction task. We also use `sched_dep_hour` rather than actual departure time, since actual departure time is not available for the flights we need to predict.
+```{r}
+# Inbound flight features
+arrivals_train <- bind_rows(
+  clean_flights(read_csv(here("data", "flights2023.csv"), show_col_types = FALSE)) |>
+    filter(dest == "PIT") |> mutate(data_year = 2023),
+  clean_flights(read_csv(here("data", "flights2024.csv"), show_col_types = FALSE)) |>
+    filter(dest == "PIT") |> mutate(data_year = 2024)
+)
+
+# Only visible arrivals have non-NA arr_delay bc guess-period arrivals are blanked out
+arrivals_test_visible <- clean_flights(
+  read_csv(here("data", "flights2025_visible.csv"), show_col_types = FALSE)
+) |> filter(dest == "PIT") |> mutate(data_year = 2025)
+
+# For each (date, tail_num), keep the latest arriving flight as the inbound leg
+make_inbound_lookup <- function(arrivals_df) {
+  arrivals_df |>
+    filter(!is.na(tail_num), tail_num != "", !is.na(arr_delay)) |>
+    group_by(fl_date, tail_num) |>
+    slice_max(crs_arr_time, n = 1, with_ties = FALSE) |>
+    ungroup() |>
+    select(fl_date, tail_num,
+           inbound_arr_delay = arr_delay,  # minutes late on arrival
+           inbound_arr_del15 = arr_del15,  # binary: arrived >= 15 min late
+           inbound_crs_arr_time = crs_arr_time)  # scheduled arrival time
+}
+
+inbound_train <- make_inbound_lookup(arrivals_train)
+inbound_visible <- make_inbound_lookup(arrivals_test_visible)
+inbound_guess <- inbound_visible  # using visible data too
+
+join_inbound <- function(dep_df, inbound_df) {
+  dep_df |>
+    left_join(inbound_df, by = c("fl_date", "tail_num")) |>
+    mutate(
+      # min between scheduled inbound arrival and scheduled departure
+      turnaround_mins = sched_dep_hour * 60 + (crs_dep_time %% 100) -
+                          (inbound_crs_arr_time %/% 100 * 60 + inbound_crs_arr_time %% 100),
+      # indicator (< 45 min scheduled buffer is risky)
+      tight_turnaround = if_else(!is.na(turnaround_mins) & turnaround_mins < 45, 1L, 0L),
+      # indicator (whether we found a matching inbound leg at all)
+      # assume has_inbound = 0 identifies aircraft that is first flight/overnight
+      has_inbound = if_else(!is.na(inbound_arr_delay), 1L, 0L),
+      # fill unmatched rows with 0 (no evidence of inbound delay)
+      inbound_arr_delay = coalesce(as.numeric(inbound_arr_delay), 0),
+      inbound_arr_del15 = coalesce(as.numeric(inbound_arr_del15), 0),
+      turnaround_mins = coalesce(turnaround_mins, 0)
+    )
+}
+
+train <- join_inbound(train, inbound_train)
+test_visible <- join_inbound(test_visible, inbound_visible)
+test_guess <- join_inbound(test_guess, inbound_guess)
+```
+
+We focus on Pittsburgh departures because that is the airport of interest in the prediction task. We also use `sched_dep_hour` rather than actual departure time, since actual departure time isn't available for the flights we need to predict.
 
 # Exploratory Data Analysis
 
-The goal of the EDA is not just to describe the data, but to identify patterns that are both predictive and available before departure. In particular, we want to see whether delay risk depends in a stable way on scheduling, carrier, route, seasonality, and same-day operating conditions.
+The goal of the EDA is to identify patterns that are both predictive and available before departure. In particular, we want to see whether delay risk depends in a stable way on scheduling, carrier, route, seasonality, and same-day operating conditions.
 
 ## Missingness
 
 ```{r}
-# Missingness in the main timing and target fields
+# Missingness in the main fields
 colSums(is.na(train[, c("dep_del15", "dep_time", "crs_dep_time")]))
 
 # Variables with nonzero missingness
@@ -252,7 +285,7 @@ hour_delay_tbl |>
  theme_minimal()
 ```
 
-Delay rates rise steadily over the course of the day and are highest in the evening. This fits the idea of cascading delays: early flights start the day with fewer disruptions from previous legs, while later flights are more exposed to effects from earlier problems. This makes scheduled departure hour one of the strongest single predictors in the dataset.
+Delay rates increase steadily over the course of the day and are highest in the evening. This aligns with the idea of cascading delays: early flights start the day with fewer disruptions from previous legs, while later flights are more affected by earlier problems. This suggests scheduled departure hour may be a strong predictor in the dataset.
 
 ## Carrier-by-Hour Interaction
 
@@ -287,7 +320,7 @@ carrier_hour_tbl |>
  theme_minimal()
 ```
 
-The carrier effect is not the same at every hour. Some carriers remain fairly stable across the day, while others become much more delay-prone in the evening. This suggests that a model with only main effects may miss meaningful structure, so either an explicit carrier-by-hour feature or a nonlinear model should help.
+The carrier effect is not the same at every hour. Some carriers remain fairly stable across the day, while others become much more likely to be delayed in the evening. This suggests that a model with only main effects may miss meaningful structure, so we consider adding either an explicit carrier-by-hour feature or using a nonlinear model.
 
 ## Seasonality and Calendar Effects
 
@@ -334,7 +367,7 @@ train |>
 ```
 
 ```{r}
-# Delay rate by calendar date, aligned to a common year for display
+# Delay rate by calendar date, aligned to a common year for display purposes
 train |>
  filter(!is.na(dep_del15)) |>
  mutate(plot_date = make_date(year = 2010, month = as.integer(as.character(month)), day = day_of_month)) |>
@@ -355,7 +388,7 @@ train |>
  theme_minimal()
 ```
 
-Delays are worse in the summer months and in December, which is consistent with heavier travel volume and more weather-related disruption. The day-of-week pattern is milder, but it still suggests that weekly operating patterns contain some signal. The daily calendar plot also shows that these seasonal peaks are not spread evenly across the month, which supports adding a simple calendar feature rather than relying only on month.
+Delays are worse in the summer months and in December, which is consistent with heavier travel during holidays and more weather-related disruption. The day-of-week pattern is less strong, but it still suggests that weekly operating patterns contain some signal. The daily calendar plot also shows that these seasonal peaks are not spread evenly across the month, which supports adding a other calendar features rather than relying only on month.
 
 ## Destination and Distance Effects
 
@@ -419,7 +452,7 @@ train |>
  theme_minimal()
 ```
 
-Delay rates differ across destinations, even among the busiest PIT routes, which suggests that route context adds information beyond carrier and time of day alone. Longer routes also show higher delay rates on average, so distance should remain in the model and may be easier to capture through both a raw continuous version and a bucketed factor version
+Delay rates differ across destinations, even among the busiest PIT routes, which suggests that route context adds information beyond carrier and time of day alone. Longer routes also show higher delay rates on average, so we should keep distance in the model. This may be easier to capture through both a raw continuous version and a bucketed factor version.
 
 ## High-Delay Days
 
@@ -449,147 +482,83 @@ bad_days_tbl |>
  theme_minimal()
 ```
 
-A small number of days have unusually high delay rates, which suggests that there are broader operating shocks affecting many flights at once. That motivates adding dynamic same-day features based on earlier visible flights, along with a historical calendar-day disruption feature learned from the training data.
+A small number of days have unusually high delay rates, which suggests that there are broader operating shocks affecting many flights at once. That motivates adding same-day features based on earlier visible flights, along with a historical calendar-day disruption feature learned from the training data.
 
 # Feature Engineering
 
-The EDA suggests that delay risk depends on a mix of stable historical tendencies and day-specific operating conditions. Based on those patterns, we engineer features that capture time-of-day effects, carrier and route history, route distance, seasonality, and same-day disruption.
+The EDA suggests that delay risk depends on a mix of stable past patterns and daily operating conditions. Based on those patterns, we engineer features that capture time-of-day effects, carrier and route history, route distance, seasonality, and same-day disruption.
 
-## Basic Features
+## Add Basic Modeling Features
 
 ```{r}
 add_basic_features <- function(df) {
-  df |>
-    mutate(
-      sched_dep_minute = crs_dep_time %% 100,
-      sched_dep_mins_since_midnight = sched_dep_hour * 60 + sched_dep_minute,
-
-      hour_bucket = case_when(
-        sched_dep_hour <= 8  ~ "early_morning",
-        sched_dep_hour <= 12 ~ "morning",
-        sched_dep_hour <= 17 ~ "afternoon",
-        sched_dep_hour <= 21 ~ "evening",
-        TRUE ~ "late_night"
-      ),
-      hour_bucket = factor(
-        hour_bucket,
-        levels = c("early_morning", "morning", "afternoon", "evening", "late_night")
-      ),
-
-      peak_season = if_else(as.integer(as.character(month)) %in% c(6, 7, 8, 12), 1L, 0L),
-      is_evening = if_else(sched_dep_hour >= 18, 1L, 0L),
-      is_morning = if_else(sched_dep_hour <= 8, 1L, 0L),
-      is_weekend = if_else(as.integer(as.character(day_of_week)) %in% c(6, 7), 1L, 0L),
-
-      distance_bucket = case_when(
-        distance > 600 ~ ">600",
-        distance > 300 ~ "301-600",
-        TRUE ~ "<=300"
-      ),
-      distance_bucket = factor(
-        distance_bucket,
-        levels = c("<=300", "301-600", ">600")
-      ),
-
-      long_flight = if_else(distance > 600, 1L, 0L),
-      evening_long_flight = if_else(distance > 600 & sched_dep_hour >= 18, 1L, 0L),
-
-      carrier_hour = paste(op_unique_carrier, sched_dep_hour, sep = "_"),
-      route = paste(op_unique_carrier, dest, sep = "_")
-    )
+ df |>
+ mutate(
+ peak_season = if_else(as.integer(as.character(month)) %in% c(6, 7, 8, 12), 1, 0),
+ is_evening = if_else(sched_dep_hour >= 18, 1, 0),
+ is_morning = if_else(sched_dep_hour <= 8, 1, 0),
+ distance_bucket = case_when(
+ distance > 600 ~ ">600",
+ distance > 300 ~ "301-600",
+ TRUE ~ "<=300"
+ ),
+ carrier_hour = paste(op_unique_carrier, sched_dep_hour, sep = "_"),
+ # scheduled arrival hour at destination
+ sched_arr_hour = floor(crs_arr_time / 100),
+ is_late_arrival = if_else(sched_arr_hour >= 21 | sched_arr_hour <= 1, 1L, 0L),
+ # scheduled flight duration
+ crs_elapsed_time = as.numeric(crs_elapsed_time)
+ )
 }
+
+train <- add_basic_features(train)
+test_visible <- add_basic_features(test_visible)
+test_guess <- add_basic_features(test_guess)
 ```
 
 These features directly reflect the strongest patterns from the EDA. In particular, `peak_season`, the morning and evening indicators, the distance bucket, and the carrier-by-hour combination all transform observed structure in the data into modeling variables.
 
-```{r}
-add_schedule_density_features <- function(df) {
-  df |>
-    arrange(fl_date, crs_dep_time) |>
-    group_by(fl_date) |>
-    mutate(
-      day_total_departures = n(),
-      scheduled_position_today = row_number() - 1,
-      day_progress = if_else(day_total_departures > 1,
-                             scheduled_position_today / (day_total_departures - 1),
-                             0)
-    ) |>
-    group_by(fl_date, sched_dep_hour) |>
-    mutate(
-      hour_total_departures = n(),
-      scheduled_position_hour = row_number() - 1
-    ) |>
-    ungroup() |>
-    mutate(
-      hour_share_of_day = hour_total_departures / pmax(day_total_departures, 1)
-    )
-}
-
-# Train features
-train <- train |>
-  add_basic_features() |>
-  add_schedule_density_features()
-
-# Compute schedule-based features on the full 2025 PIT departure file
-test_full_fe <- test |>
-  add_basic_features() |>
-  add_schedule_density_features()
-
-# Then split back into visible / guess using the stable key
-test_visible <- test_full_fe |>
-  semi_join(test_visible |> select(flight_key), by = "flight_key")
-
-test_guess <- test_full_fe |>
-  semi_join(test_guess |> select(flight_key), by = "flight_key")
-```
-
-## Smoothed Historical Delay Rates
-
-Raw group means are noisy, especially for carriers and routes with few flights at PIT. We use James-Stein style shrinkage: each group's rate is a weighted blend of its observed mean and the global delay rate, with the weight determined by how many observations the group has. Groups with lots of data are trusted; groups with little data are pulled toward the global mean.
+## Build Smoothed Historical Delay-Rate Features
 
 ```{r}
 global_delay_rate <- mean(train$dep_del15, na.rm = TRUE)
 
 make_smoothed_rates <- function(df, group_var, target = "dep_del15", m = 100) {
-  group_sym <- rlang::sym(group_var)
-  target_sym <- rlang::sym(target)
+ group_sym <- rlang::sym(group_var)
+ target_sym <- rlang::sym(target)
 
-  df |>
-    filter(!is.na(!!target_sym)) |>
-    group_by(!!group_sym) |>
-    summarise(
-      n = n(),
-      mean_target = mean(!!target_sym),
-      .groups = "drop"
-    ) |>
-    mutate(
-      smoothed_rate = (n * mean_target + m * global_delay_rate) / (n + m)
-    ) |>
-    select(!!group_sym, smoothed_rate, n)
+ df |>
+ filter(!is.na(!!target_sym)) |>
+ group_by(!!group_sym) |>
+ summarise(
+ n = n(),
+ mean_target = mean(!!target_sym),
+ .groups = "drop"
+ ) |>
+ mutate(
+ smoothed_rate = (n * mean_target + m * global_delay_rate) / (n + m)
+ ) |>
+ select(!!group_sym, smoothed_rate, n)
 }
 ```
 
 ```{r}
-# Route = carrier + dest; more specific than either alone
-# Stable carrier and destination rates
+# Route = carrier + dest combination
+train <- train |> mutate(route = paste(op_unique_carrier, dest, sep = "_"))
+test_visible <- test_visible |> mutate(route = paste(op_unique_carrier, dest, sep = "_"))
+test_guess <- test_guess |> mutate(route = paste(op_unique_carrier, dest, sep = "_"))
+
+# Carrier and dest rates
 carrier_rates <- make_smoothed_rates(train, "op_unique_carrier", m = 200) |>
-  rename(
-    carrier_delay_rate_smooth = smoothed_rate,
-    carrier_n = n
-  )
+ rename(carrier_delay_rate_smooth = smoothed_rate, carrier_n = n)
 
 dest_rates <- make_smoothed_rates(train, "dest", m = 200) |>
-  rename(
-    dest_delay_rate_smooth = smoothed_rate,
-    dest_n = n
-  )
+ rename(dest_delay_rate_smooth = smoothed_rate, dest_n = n)
 ```
 
 ```{r}
-# Out-of-fold (OOF) encoding for fine-grained features
-# carrier_hour, route, and flight_num are granular enough that computing them on the full
-# training set leaks label info into val rows. OOF fixes this: each row's rate is computed
-# from the other 4 folds only. Test sets use full-train lookups since their labels are never seen.
+# OOF (out-of-fold) smoothed rates for important features
+# Each row's rate is computed from the other 4 folds
 set.seed(100)
 n_folds <- 5
 fold_id <- sample(rep(1:n_folds, length.out = nrow(train)))
@@ -597,83 +566,109 @@ fold_id <- sample(rep(1:n_folds, length.out = nrow(train)))
 make_oof_rates <- function(df, group_var, target = "dep_del15", m = 100) {
   group_sym <- rlang::sym(group_var)
   target_sym <- rlang::sym(target)
+  out_col <- paste0(group_var, "_oof_rate")
   global <- mean(df[[target]], na.rm = TRUE)
 
   result <- numeric(nrow(df))
   for (k in 1:n_folds) {
     in_fold <- which(fold_id == k)
     out_fold <- which(fold_id != k)
-
     lookup <- df[out_fold, ] |>
       filter(!is.na(!!target_sym)) |>
       group_by(!!group_sym) |>
-      summarise(
-        n = n(),
-        mean_t = mean(!!target_sym),
-        .groups = "drop"
-      ) |>
+      summarise(n = n(), mean_t = mean(!!target_sym), .groups = "drop") |>
       mutate(rate = (n * mean_t + m * global) / (n + m))
-
     merged <- df[in_fold, ] |>
       select(!!group_sym) |>
       left_join(lookup |> select(!!group_sym, rate), by = group_var)
-
     result[in_fold] <- coalesce(merged$rate, global)
   }
-
   result
 }
 
+# Use stronger smoothing (bigger m) for route and flight level features bc those groups are more granular, so have fewer observations per group (noisier raw delay rates than for carrier_hour)
+train$carrier_hour_delay_rate_smooth <- make_oof_rates(train, "carrier_hour", m = 100)
+train$route_delay_rate_smooth <- make_oof_rates(train, "route", m = 150)
+train$flight_num_delay_rate_smooth <- make_oof_rates(train, "flights", m = 150)
+
+# Week-of-year smoothed rate
+train <- train |> mutate(week_of_year = as.character(week(fl_date)))
+test_visible <- test_visible |> mutate(week_of_year = as.character(week(fl_date)))
+test_guess <- test_guess |> mutate(week_of_year = as.character(week(fl_date)))
+train$week_delay_rate_smooth <- make_oof_rates(train, "week_of_year", m = 50)
+train$avg_delay_rate_for_calendar_day <- train$week_delay_rate_smooth  # keep for computing high_disruption
+
+# For test sets, use the full-train lookup
+carrier_hour_rates <- make_smoothed_rates(train, "carrier_hour", m = 100) |>
+  rename(carrier_hour_delay_rate_smooth = smoothed_rate, carrier_hour_n = n)
+
+flight_num_rates <- make_smoothed_rates(train, "flights", m = 150) |>
+  rename(flight_num_delay_rate_smooth = smoothed_rate, flight_num_n = n)
+
+route_rates <- make_smoothed_rates(train, "route", m = 150) |>
+  rename(route_delay_rate_smooth = smoothed_rate, route_n = n)
+
+week_rates <- make_smoothed_rates(train, "week_of_year", m = 50) |>
+  rename(week_delay_rate_smooth = smoothed_rate, week_n = n)
+
+bad_day_lookup <- train |>
+  filter(!is.na(dep_del15)) |>
+  group_by(week_of_year) |>
+  summarise(avg_delay_rate_for_calendar_day = mean(dep_del15), .groups = "drop")
+```
+
+Rather than using raw historical means, we shrink each group toward the global average when the number of observations is small. For fine-grained features like carrier-hour and route, we use out-of-fold encoding so that each training row's smoothed rate is computed from held-out folds only, preventing label leakage into the validation set. Test sets always use full-train lookups since their labels are unseen.
+
+## Tail Number Delay Rate
+
+```{r}
+train |>
+  filter(!is.na(tail_num)) |>
+  count(tail_num, name = "n_flights") |>
+  summarise(median_flights = median(n_flights))
+
+# Smoothed delay rate per aircraft tail number, avg smoothing since median flights = 10
+train$tail_delay_rate_smooth <- make_oof_rates(train, "tail_num", m = 100)
+
+tail_rates <- make_smoothed_rates(train, "tail_num", m = 100) |>
+  rename(tail_delay_rate_smooth = smoothed_rate, tail_n = n)
+```
+
+## Hourly Congestion at PIT
+
+```{r}
+# Number of flights scheduled out of PIT in the same departure hour
+hourly_congestion <- train |>
+  group_by(fl_date, sched_dep_hour) |>
+  summarise(flights_same_hour = n(), .groups = "drop")
+
 train <- train |>
-  mutate(
-    week_of_year = as.character(week(fl_date))
-  )
+  left_join(hourly_congestion, by = c("fl_date", "sched_dep_hour"))
+
+# For test sets, use average congestion by hour across training days
+# (bc we don't know actual 2025 schedules ahead of time for the guess flights)
+avg_hourly_congestion <- train |>
+  group_by(sched_dep_hour) |>
+  summarise(avg_flights_same_hour = mean(flights_same_hour, na.rm = TRUE), .groups = "drop")
 
 test_visible <- test_visible |>
-  mutate(
-    week_of_year = as.character(week(fl_date))
+  left_join(
+    test_visible |>
+      group_by(fl_date, sched_dep_hour) |>
+      summarise(flights_same_hour = n(), .groups = "drop"),
+    by = c("fl_date", "sched_dep_hour")
   )
 
 test_guess <- test_guess |>
-  mutate(
-    week_of_year = as.character(week(fl_date))
-  )
-
-train$carrier_hour_delay_rate_smooth <- make_oof_rates(train, "carrier_hour", m = 100)
-train$route_delay_rate_smooth        <- make_oof_rates(train, "route", m = 150)
-train$flight_num_delay_rate_smooth   <- make_oof_rates(train, "flights", m = 150)
-train$week_delay_rate_smooth         <- make_oof_rates(train, "week_of_year", m = 50)
-
-# Full-train lookups for test sets
-carrier_hour_rates <- make_smoothed_rates(train, "carrier_hour", m = 100) |>
-  rename(
-    carrier_hour_delay_rate_smooth = smoothed_rate,
-    carrier_hour_n = n
-  )
-
-route_rates <- make_smoothed_rates(train, "route", m = 150) |>
-  rename(
-    route_delay_rate_smooth = smoothed_rate,
-    route_n = n
-  )
-
-flight_num_rates <- make_smoothed_rates(train, "flights", m = 150) |>
-  rename(
-    flight_num_delay_rate_smooth = smoothed_rate,
-    flight_num_n = n
-  )
-
-week_rates <- make_smoothed_rates(train, "week_of_year", m = 50) |>
-  rename(
-    week_delay_rate_smooth = smoothed_rate,
-    week_n = n
-  )
+  left_join(avg_hourly_congestion, by = "sched_dep_hour") |>
+  mutate(flights_same_hour = avg_flights_same_hour)
 ```
 
 ## Apply Historical Features to Train and Test
 
 ```{r}
-# This joins both the rates and the support counts, and creates log-count features that can help trees and linear models
+# For train OOF columns already attached above so only need to join carrier/dest rates
+# For test sets join all lookup tables from full training data
 apply_rate_features <- function(df, is_train = FALSE) {
   df <- df |>
     left_join(carrier_rates, by = "op_unique_carrier") |>
@@ -682,43 +677,24 @@ apply_rate_features <- function(df, is_train = FALSE) {
       carrier_delay_rate_smooth = coalesce(carrier_delay_rate_smooth, global_delay_rate),
       dest_delay_rate_smooth = coalesce(dest_delay_rate_smooth, global_delay_rate)
     )
-
   if (!is_train) {
     df <- df |>
       left_join(carrier_hour_rates, by = "carrier_hour") |>
-      left_join(route_rates, by = "route") |>
       left_join(flight_num_rates, by = "flights") |>
+      left_join(route_rates, by = "route") |>
       left_join(week_rates, by = "week_of_year") |>
+      left_join(bad_day_lookup, by = "week_of_year") |>
+      left_join(tail_rates, by = "tail_num") |>
       mutate(
         carrier_hour_delay_rate_smooth = coalesce(carrier_hour_delay_rate_smooth, global_delay_rate),
-        route_delay_rate_smooth = coalesce(route_delay_rate_smooth, global_delay_rate),
         flight_num_delay_rate_smooth = coalesce(flight_num_delay_rate_smooth, global_delay_rate),
-        week_delay_rate_smooth = coalesce(week_delay_rate_smooth, global_delay_rate)
+        route_delay_rate_smooth = coalesce(route_delay_rate_smooth, global_delay_rate),
+        week_delay_rate_smooth = coalesce(week_delay_rate_smooth, global_delay_rate),
+        avg_delay_rate_for_calendar_day = coalesce(avg_delay_rate_for_calendar_day, global_delay_rate),
+        tail_delay_rate_smooth = coalesce(tail_delay_rate_smooth, global_delay_rate)
       )
-  } else {
-    # Add support counts for train rows too
-    df <- df |>
-      left_join(carrier_hour_rates |> select(carrier_hour, carrier_hour_n), by = "carrier_hour") |>
-      left_join(route_rates |> select(route, route_n), by = "route") |>
-      left_join(flight_num_rates |> select(flights, flight_num_n), by = "flights") |>
-      left_join(week_rates |> select(week_of_year, week_n), by = "week_of_year")
   }
-
-  df |>
-    mutate(
-      carrier_n = coalesce(carrier_n, 0),
-      dest_n = coalesce(dest_n, 0),
-      carrier_hour_n = coalesce(carrier_hour_n, 0),
-      route_n = coalesce(route_n, 0),
-      flight_num_n = coalesce(flight_num_n, 0),
-      week_n = coalesce(week_n, 0),
-
-      log_carrier_n = log1p(carrier_n),
-      log_dest_n = log1p(dest_n),
-      log_carrier_hour_n = log1p(carrier_hour_n),
-      log_route_n = log1p(route_n),
-      log_flight_num_n = log1p(flight_num_n)
-    )
+  df
 }
 
 train_fe <- apply_rate_features(train, is_train = TRUE)
@@ -726,109 +702,109 @@ test_visible_fe <- apply_rate_features(test_visible, is_train = FALSE)
 test_guess_fe <- apply_rate_features(test_guess, is_train = FALSE)
 ```
 
-## Same-Day Disruption Features
+All of these encodings are learned using the training data and then applied to the test sets. If a group in the test set was not seen in training, we fall back to the global delay rate.
+
+## Add Running Same-Day Delay Features
 
 ```{r}
-# Names now match across train, visible, and guess, and it adds a stronger “pressure” feature.
 add_running_day_features <- function(df) {
-  df |>
-    arrange(fl_date, crs_dep_time) |>
-    group_by(fl_date) |>
-    mutate(
-      before_today = row_number() - 1,
-      delays_before_today = lag(cumsum(replace_na(dep_del15, 0)), default = 0),
-      prior_same_day_delay_rate = if_else(
-        before_today > 0,
-        delays_before_today / before_today,
-        0
-      ),
-      visible_count = before_today,
-      visible_delay_rate = prior_same_day_delay_rate
-    ) |>
-    ungroup() |>
-    mutate(
-      disruption_pressure = visible_delay_rate * log1p(visible_count),
-      schedule_pressure = log1p(day_total_departures) * day_progress
-    )
+ df |>
+ arrange(fl_date, crs_dep_time) |>
+ group_by(fl_date) |>
+ mutate(
+ before_today = row_number() - 1,
+ delays_before_today = lag(cumsum(replace_na(dep_del15, 0)), default = 0),
+ prior_same_day_delay_rate = if_else(
+ before_today > 0,
+ delays_before_today / before_today,
+ 0
+ )
+ ) |>
+ ungroup()
 }
 
 train_fe <- add_running_day_features(train_fe)
 test_visible_fe <- add_running_day_features(test_visible_fe)
+test_guess_fe <- add_running_day_features(test_guess_fe)
 ```
+
+This feature captures how disrupted the system already is earlier in the day. It might be especially useful because the prediction setup provides visibility into earlier flights on the same day.
 
 ```{r}
-# For guess rows, use visible flights earlier that day
 test_visible_day_summary <- test_visible_fe |>
-  filter(!is.na(dep_del15)) |>
-  group_by(fl_date) |>
-  summarise(
-    visible_count = n(),
-    visible_delay_rate = mean(dep_del15),
-    .groups = "drop"
-  )
+ filter(!is.na(dep_del15)) |>
+ group_by(fl_date) |>
+ summarise(
+ visible_count = n(),
+ visible_delay_rate = mean(dep_del15),
+ .groups = "drop"
+ )
 
 test_guess_fe <- test_guess_fe |>
-  left_join(test_visible_day_summary, by = "fl_date") |>
-  mutate(
-    visible_count = coalesce(visible_count, 0),
-    visible_delay_rate = coalesce(visible_delay_rate, global_delay_rate),
-    disruption_pressure = visible_delay_rate * log1p(visible_count),
-    schedule_pressure = log1p(day_total_departures) * day_progress
-  )
+ left_join(test_visible_day_summary, by = "fl_date") |>
+ mutate(
+ visible_count = coalesce(visible_count, 0),
+ visible_delay_rate = coalesce(visible_delay_rate, global_delay_rate)
+ )
 ```
 
-For the guess set, we cannot directly use the unknown future labels. Instead, we summarize the flights that are already visible on that date and merge those day-level summaries into the flights we need to predict.
+For the guess set, we can't use the unknown future labels directly. So, we can try summarizing the flights that are already visible on that date and merge those daily summaries into the flights we need to predict.
 
 ## Carrier and Destination Encodings
 
-Raw `op_unique_carrier` and `dest` factors can't go directly into the model because 2025 may contain carriers or destinations not seen in training, which would produce NA columns in the model matrix. Instead we use three stable encodings: a carrier size bucket (large/medium/small by flight count), a geographic region grouping for destinations, and a hub airport flag.
+Also, the raw `op_unique_carrier` and `dest` factors can't be used directly because 2025 may
+contain carriers or destinations not seen in 2023-2024 training data, which would
+produce NA columns when building the model matrix. We already have smoothed delay rates
+for both, which solve this problem. We add a few additional encodings below to recover
+some of the signal that raw dummies would have provided.
 
 ```{r}
-# Keeps your broader groupings, which are still useful
+# Option 1: carrier size group
+# Collapses carriers by volume at PIT so new/rare carriers in 2025 fall into
+# a meaningful bucket rather than being dropped or NA
 carrier_size <- train |>
   count(op_unique_carrier) |>
-  mutate(
-    carrier_size = case_when(
-      n >= 5000 ~ "large",
-      n >= 1000 ~ "medium",
-      TRUE ~ "small"
-    )
-  ) |>
+  mutate(carrier_size = case_when(
+    n >= 5000 ~ "large",
+    n >= 1000 ~ "medium",
+    TRUE ~ "small"
+  )) |>
   select(op_unique_carrier, carrier_size)
 
-hub_airports <- c(
-  "ATL", "ORD", "DFW", "DEN", "CLT", "JFK", "LAX",
-  "LGA", "EWR", "SFO", "SEA", "MIA", "BOS", "MSP", "DTW", "PHL"
-)
+# Option 2: hub vs. non-hub destination
+# Major hub airports tend to have higher system-wide congestion; captures that
+# without needing a dummy for every destination
+hub_airports <- c("ATL", "ORD", "DFW", "DEN", "CLT", "JFK", "LAX",
+                   "LGA", "EWR", "SFO", "SEA", "MIA", "BOS", "MSP", "DTW", "PHL")
 
+# Option 3: regional grouping for destination
+# Groups destinations by geography — more stable across years than individual airports
 dest_region <- train |>
   distinct(dest) |>
-  mutate(
-    dest_region = case_when(
-      dest %in% c("BOS", "JFK", "LGA", "EWR", "PHL", "DCA", "IAD", "BWI") ~ "northeast",
-      dest %in% c("ATL", "CLT", "MIA", "TPA", "MCO", "RDU", "BNA", "MEM") ~ "south",
-      dest %in% c("ORD", "MDW", "DTW", "MSP", "CLE", "CMH", "IND", "MKE") ~ "midwest",
-      dest %in% c("DFW", "DAL", "IAH", "HOU", "MSY", "SAT", "AUS") ~ "southwest",
-      dest %in% c("DEN", "SLC", "PHX", "LAS", "ABQ") ~ "mountain",
-      dest %in% c("LAX", "SFO", "SEA", "PDX", "SAN", "SJC", "OAK") ~ "west",
-      TRUE ~ "other"
-    )
-  )
+  mutate(dest_region = case_when(
+    dest %in% c("BOS", "JFK", "LGA", "EWR", "PHL", "DCA", "IAD", "BWI") ~ "northeast",
+    dest %in% c("ATL", "CLT", "MIA", "TPA", "MCO", "RDU", "BNA", "MEM") ~ "south",
+    dest %in% c("ORD", "MDW", "DTW", "MSP", "CLE", "CMH", "IND", "MKE") ~ "midwest",
+    dest %in% c("DFW", "DAL", "IAH", "HOU", "MSY", "SAT", "AUS") ~ "southwest",
+    dest %in% c("DEN", "SLC", "PHX", "LAS", "ABQ") ~ "mountain",
+    dest %in% c("LAX", "SFO", "SEA", "PDX", "SAN", "SJC", "OAK") ~ "west",
+    TRUE ~ "other"
+  ))
 
 add_carrier_dest_features <- function(df) {
   df |>
     left_join(carrier_size, by = "op_unique_carrier") |>
     left_join(dest_region, by = "dest") |>
     mutate(
-      carrier_size = coalesce(carrier_size, "small"),
-      dest_region = coalesce(dest_region, "other"),
+      carrier_size = coalesce(carrier_size, "small"),  # unseen carriers are small
+      dest_region = coalesce(dest_region, "other"),  # unseen dests are other
       is_hub_dest = if_else(dest %in% hub_airports, 1L, 0L),
       carrier_size = factor(carrier_size, levels = c("small", "medium", "large")),
       dest_region = factor(dest_region),
+      # binary flag derived from week rate
       high_disruption_calendar_day = if_else(
         week_delay_rate_smooth >= quantile(week_delay_rate_smooth, 0.90, na.rm = TRUE),
-        1L,
-        0L
+        1L, 0L
       )
     )
 }
@@ -838,82 +814,77 @@ test_visible_fe <- add_carrier_dest_features(test_visible_fe)
 test_guess_fe <- add_carrier_dest_features(test_guess_fe)
 ```
 
+The smoothed delay rates (`carrier_delay_rate_smooth`, `dest_delay_rate_smooth`) already
+capture most of the signal from the raw factors — they encode historical delay tendency
+per group and fall back to the global mean for unseen levels. The new features above add
+complementary structure: carrier size captures operational scale, hub destination captures
+congestion exposure, and regional grouping adds geographic context that's stable even if
+specific airports weren't in training.
+
 ## Final Modeling Data Frames
 
 ```{r}
 model_vars <- c(
   "dep_del15",
-
-  # Time / schedule
   "sched_dep_hour",
-  "sched_dep_mins_since_midnight",
-  "hour_bucket",
+  "sched_arr_hour",
+  "is_late_arrival",
+  "crs_elapsed_time",
+  "carrier_size",
+  "dest_region",
+  "is_hub_dest",
+  "distance",
+  "distance_bucket",
   "month",
   "day_of_week",
   "peak_season",
   "is_evening",
   "is_morning",
-  "is_weekend",
-
-  # Distance / route shape
-  "distance",
-  "distance_bucket",
-  "long_flight",
-  "evening_long_flight",
-
-  # Schedule congestion
-  "day_total_departures",
-  "day_progress",
-  "hour_total_departures",
-  "schedule_pressure",
-
-  # Carrier / destination encodings
-  "carrier_size",
-  "dest_region",
-  "is_hub_dest",
-
-  # Historical delay tendency
   "carrier_delay_rate_smooth",
-  "carrier_hour_delay_rate_smooth",
+  "dest_delay_rate_smooth",
+  "flight_num_delay_rate_smooth",
   "route_delay_rate_smooth",
-
-  # Support / reliability
-  "log_carrier_n",
-  "log_carrier_hour_n",
-  "log_route_n",
-
-  # Same-day disruption
+  "tail_delay_rate_smooth",
   "prior_same_day_delay_rate",
   "before_today",
-  "disruption_pressure",
-
-  # Calendar disruption
-  "high_disruption_calendar_day"
+  "visible_delay_rate",
+  "flights_same_hour",
+  "week_delay_rate_smooth",
+  "high_disruption_calendar_day",
+  
+  # inbound flight features only exist for ~55% of flights in training, NA filled with 0
+  "inbound_arr_delay",
+  "inbound_arr_del15",
+  "has_inbound",
+  "tight_turnaround",
+  "turnaround_mins"
 )
 
 train_model_df <- train_fe |>
-  select(any_of(model_vars)) |>
-  filter(!is.na(dep_del15))
+ select(any_of(model_vars)) |>
+ filter(!is.na(dep_del15))
 
 test_visible_model_df <- test_visible_fe |>
-  select(any_of(model_vars))
+ select(any_of(model_vars))
 
 test_guess_model_df <- test_guess_fe |>
-  select(any_of(model_vars))
+ select(any_of(model_vars))
 ```
 
-At this point, `train_model_df` contains the response and engineered predictors for model fitting, while `test_guess_model_df` contains the same predictors for the flights we need to score. The final feature set reflects the main conclusions from the EDA: time of day is a major driver, carrier, destination, route are important, and same-day disruption adds useful information.
+At this point, `train_model_df` contains the response and engineered predictors for model fitting, while `test_guess_model_df` contains the same predictors for the flights we need to evaluate. The final feature set is based on the main conclusions from the EDA: time of day is a major driver, carrier, destination, route are important, and we believe same-day disruption adds useful information.
 
 # Modelling
 
 ## Setup
 
 ```{r}
-# Helper to align model matrices between train and test so factor levels always match.
-# Adds zero columns for any level in train not seen in test, drops extras.
+# Aligns model matrices between train and test so column sets always match
+# If a factor level exists in train but not in test, adds a zero column
+# If test has extra columns not in train, drop
+# Prevents dimension mismatches when new factor levels appear in 2025 data
 make_aligned_matrix <- function(formula, train_df, test_df) {
   x_train <- model.matrix(formula, data = train_df)[, -1, drop = FALSE]
-  x_test  <- model.matrix(formula, data = test_df)[, -1, drop = FALSE]
+  x_test <- model.matrix(formula, data = test_df)[, -1, drop = FALSE]
 
   missing_cols <- setdiff(colnames(x_train), colnames(x_test))
   if (length(missing_cols) > 0) {
@@ -937,56 +908,31 @@ make_aligned_matrix <- function(formula, train_df, test_df) {
 }
 ```
 
-```{r}
-# Helper to align factor levels between a new data frame and the training split.
-# Needed for randomForest which requires the same factor levels at predict time.
-align_to_training <- function(new_df, train_df) {
-  common_cols <- intersect(names(train_df), names(new_df))
-
-  for (col in common_cols) {
-    # align factor columns
-    if (is.factor(train_df[[col]])) {
-      new_df[[col]] <- factor(as.character(new_df[[col]]),
-                              levels = levels(train_df[[col]]))
-    }
-
-    # align numeric/integer columns
-    if (is.numeric(train_df[[col]]) && !is.numeric(new_df[[col]])) {
-      new_df[[col]] <- as.numeric(new_df[[col]])
-    }
-
-    if (is.integer(train_df[[col]]) && !is.integer(new_df[[col]])) {
-      new_df[[col]] <- as.integer(new_df[[col]])
-    }
-  }
-
-  new_df
-}
-```
+# Modelling
 
 ```{r}
-# 80/20 train/val split for internal model evaluation
+# 80/20 train/validation split
 set.seed(100)
 
 n <- nrow(train_model_df)
 train_idx <- sample(1:n, size = 0.8 * n)
 
 train_split <- train_model_df[train_idx, ]
-test_split  <- train_model_df[-train_idx, ]
+test_split <- train_model_df[-train_idx, ]
 ```
 
 ```{r}
-# AUC and accuracy tracker — appends one row per model
+# function to track AUC and accuracym, appends one row per model to a running results table
 compute_auc <- function(auc_df = NULL, train_y, train_prob,
                         test_y, test_prob, model_name) {
   auc_train <- roc(train_y, train_prob) |> auc()
-  auc_test <- roc(test_y,  test_prob)  |> auc()
+  auc_test <- roc(test_y, test_prob) |> auc()
 
   accur_train_0.5 <- mean(train_y == (train_prob > 0.5))
-  accur_test_0.5 <- mean(test_y  == (test_prob  > 0.5))
+  accur_test_0.5 <- mean(test_y == (test_prob > 0.5))
 
   accur_train_0.6 <- mean(train_y == (train_prob > 0.6))
-  accur_test_0.6 <- mean(test_y  == (test_prob  > 0.6))
+  accur_test_0.6 <- mean(test_y == (test_prob > 0.6))
 
   df <- data.frame(
     model_name,
@@ -1008,9 +954,10 @@ compute_auc <- function(auc_df = NULL, train_y, train_prob,
 
 ```{r}
 y_train <- train_split$dep_del15
-y_test  <- test_split$dep_del15
+y_test <- test_split$dep_del15
 
-# Linear model matrix: poly(sched_dep_hour, 2) lets logistic/LASSO capture the curved hour effect
+# For our linear models (logistic regression, LASSO): add a quadratic hour term
+# to try and capture the nonlinear delay-by-hour relationship
 lm_mats <- make_aligned_matrix(
   dep_del15 ~ . + poly(sched_dep_hour, 2),
   train_split,
@@ -1020,7 +967,7 @@ lm_mats <- make_aligned_matrix(
 x_train_lm <- lm_mats$x_train
 x_test_lm <- lm_mats$x_test
 
-# XGBoost matrix: raw features only — XGBoost finds nonlinearity through splits, not poly terms
+# XGBoost: fit using raw features only
 xgb_mats <- make_aligned_matrix(
   dep_del15 ~ .,
   train_split,
@@ -1030,7 +977,8 @@ xgb_mats <- make_aligned_matrix(
 x_train_xgb <- xgb_mats$x_train
 x_test_xgb <- xgb_mats$x_test
 
-# Full-train matrix used for XGBoost CV tuning (avoids overfitting to the 80/20 split)
+# Full training set matrix used for XGBoost CV hyperparameter tuning
+# Tuning on the full train rather than the 80/20 split --> more stable estimates
 x_full_xgb <- model.matrix(dep_del15 ~ ., data = train_model_df)[, -1, drop = FALSE]
 y_full <- train_model_df$dep_del15
 ```
@@ -1038,6 +986,7 @@ y_full <- train_model_df$dep_del15
 ## Logistic Regression
 
 ```{r}
+# Baseline log reg model; benchmark
 log_reg <- glm(
   dep_del15 ~ . + poly(sched_dep_hour, 2),
   family = "binomial",
@@ -1045,7 +994,7 @@ log_reg <- glm(
 )
 
 train_prob <- predict(log_reg, type = "response", newdata = train_split)
-test_prob  <- predict(log_reg, type = "response", newdata = test_split)
+test_prob <- predict(log_reg, type = "response", newdata = test_split)
 
 auc_df <- compute_auc(
   train_y = train_split$dep_del15,
@@ -1059,6 +1008,7 @@ auc_df <- compute_auc(
 ## LASSO
 
 ```{r}
+# Logistic regression with L1 penalty, us cv to choose lambda
 cv_lasso <- cv.glmnet(
   x_train_lm,
   y_train,
@@ -1094,39 +1044,45 @@ auc_df <- compute_auc(
 
 ## XGBoost (tuned)
 
-XGBoost with default params and 100 rounds leaves a lot of AUC on the table. We tune
-the key parameters via cross-validation: `max_depth` controls tree complexity, `eta`
-controls shrinkage, and `subsample`/`colsample_bytree` add randomization to reduce
-overfitting. `nrounds` is selected by early stopping on the CV AUC curve.
+XGBoost builds an ensemble of shallow decision trees sequentially, each correcting the
+errors of the previous one. It can handle the nonlinear relationships and feature interactions
+automatically, so it should outperform the previous two linear models.
+
+We tune over a grid of key hyperparameters: `max_depth` (tree complexity), `eta`
+(learning rate / shrinkage per tree), `subsample` and `colsample_bytree` (row/column
+subsampling to reduce overfitting), `min_child_weight` (minimum observations per leaf, which
+prevents splits on small noisy groups), and `gamma` (minimum gain required to make a
+split). `nrounds` is selected by early stopping against 5-fold CV AUC on the full
+training set.
 
 ```{r}
 dtrain <- xgb.DMatrix(data = x_train_xgb, label = y_train)
-dtest  <- xgb.DMatrix(data = x_test_xgb, label = y_test)
-dfull  <- xgb.DMatrix(data = x_full_xgb, label = y_full)
+dtest <- xgb.DMatrix(data = x_test_xgb, label = y_test)
+dfull <- xgb.DMatrix(data = x_full_xgb, label = y_full)
 
 xgb_grid <- expand.grid(
-  max_depth        = c(3, 4, 5),
-  eta              = c(0.05, 0.1),
-  subsample        = c(0.7, 0.9),
+  max_depth = c(3, 4, 5),
+  eta = c(0.05, 0.1),
+  subsample = c(0.7, 0.9),
   colsample_bytree = c(0.7, 0.9),
   min_child_weight = c(10, 30),
-  gamma            = c(0, 1)
+  gamma = c(0, 1)
 )
 
-best_auc     <- 0
-best_params  <- NULL
+best_auc <- 0
+best_params <- NULL
 best_nrounds <- 100
 
 for (i in seq_len(nrow(xgb_grid))) {
   params_i <- list(
-    objective        = "binary:logistic",
-    eval_metric      = "auc",
-    max_depth        = xgb_grid$max_depth[i],
-    eta              = xgb_grid$eta[i],
-    subsample        = xgb_grid$subsample[i],
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    max_depth = xgb_grid$max_depth[i],
+    eta = xgb_grid$eta[i],
+    subsample = xgb_grid$subsample[i],
     colsample_bytree = xgb_grid$colsample_bytree[i],
     min_child_weight = xgb_grid$min_child_weight[i],
-    gamma            = xgb_grid$gamma[i]
+    gamma = xgb_grid$gamma[i]
   )
 
   cv_result <- xgb.cv(
@@ -1146,8 +1102,8 @@ for (i in seq_len(nrow(xgb_grid))) {
   best_i <- cv_result$evaluation_log$test_auc_mean[nrounds_i]
 
   if (best_i > best_auc) {
-    best_auc     <- best_i
-    best_params  <- params_i
+    best_auc <- best_i
+    best_params <- params_i
     best_nrounds <- nrounds_i
   }
 }
@@ -1162,7 +1118,7 @@ xgb_model <- xgb.train(
 )
 
 train_prob <- predict(xgb_model, dtrain)
-test_prob  <- predict(xgb_model, dtest)
+test_prob <- predict(xgb_model, dtest)
 
 auc_df <- compute_auc(
   auc_df = auc_df,
@@ -1174,9 +1130,40 @@ auc_df <- compute_auc(
 )
 ```
 
+```{r}
+# Function that ensures levels factor columns in new_df match train_df,
+# and coerces numeric/integer types to match,
+# prevents errors when 2025 data has factor levels not in 2023-2024 training
+align_to_training <- function(new_df, train_df) {
+  common_cols <- intersect(names(train_df), names(new_df))
+  
+  for (col in common_cols) {
+    # align factor columns
+    if (is.factor(train_df[[col]])) {
+      new_df[[col]] <- factor(as.character(new_df[[col]]),
+                              levels = levels(train_df[[col]]))
+    }
+    
+    # align numeric/integer columns
+    if (is.numeric(train_df[[col]]) && !is.numeric(new_df[[col]])) {
+      new_df[[col]] <- as.numeric(new_df[[col]])
+    }
+    
+    if (is.integer(train_df[[col]]) && !is.integer(new_df[[col]])) {
+      new_df[[col]] <- as.integer(new_df[[col]])
+    }
+  }
+  
+  new_df
+}
+```
+
 ## Random Forest
 
 ```{r}
+# Ensemble of decision trees trained on bootstrap samples with random feature subsets.
+# More stable than a single tree and naturally handles nonlinearity and interactions.
+# dep_del15 cast to factor so randomForest treats this as classification (not regression).
 train_split_rf <- train_split |>
   mutate(dep_del15 = as.factor(dep_del15))
 
@@ -1209,7 +1196,9 @@ auc_df <- compute_auc(
 ## Balanced Random Forest
 
 ```{r}
-# Upweight the minority (delayed) class to counteract the 80/20 imbalance
+# Same as Random Forest but with inverse-frequency class weights
+# Increases weight for the delayed class (imbalanced ~20%) so the model doesn't just learn
+# to predict "on time" for everything, which would give high accuracy but miss delays
 class_counts <- table(train_split_rf$dep_del15)
 
 class_weights <- as.numeric(
@@ -1242,9 +1231,7 @@ auc_df <- compute_auc(
 
 ## Ensembles
 
-Simple averaging across all models dilutes the best performers. We compare: (1) the naive
-average, (2) a weighted average that upweights XGBoost, which typically dominates on
-tabular data, and (3) majority vote.
+We compare: (1) the naive average, (2) a weighted average that upweights XGBoost, which should be the best performer, and (3) majority vote.
 
 ```{r}
 preds_df <- data.frame(
@@ -1268,7 +1255,8 @@ auc_df <- compute_auc(
   model_name = "Ensemble (Avg)"
 )
 
-# Weighted average: XGBoost gets more weight since it's the strongest model on this data
+# Weighted average; weights selected pretty arbitrarily 
+# but we could try normalizing AUC-based weights
 preds_df$weighted_prob <- with(
   preds_df,
   0.50 * xgboost +
@@ -1304,7 +1292,8 @@ auc_df <- compute_auc(
 # Results - 2025 Visible
 
 ```{r}
-# AUC and accuracy on the 2025 visible set (the portion of test data where we know the true labels)
+# Evaluate each model on the 2025 visible set, which hsa flights we can observe
+# and therefore acts as our proxy for true test performance before submitting on the guess set
 compute_vis_auc <- function(auc_df = NULL, y, prob, model_name) {
   auc <- roc(y, prob) |> auc()
   accuracy <- mean(y == (prob > 0.5), na.rm = TRUE)
@@ -1357,7 +1346,7 @@ lasso_prob <- predict(
 
 xgb_prob <- predict(xgb_model, dvis)
 
-# RF-compatible visible data (factor levels must match training)
+# RF-compatible visible data
 test_visible_rf <- test_visible_model_df_eval |>
   mutate(dep_del15 = as.factor(dep_del15))
 
@@ -1446,3 +1435,74 @@ vis_auc |> arrange(desc(accuracy))
 xgb.importance(model = xgb_model) |>
   xgb.plot.importance(top_n = 15, main = "XGBoost feature importance (top 15)")
 ```
+
+```{r}
+# Prepare guess data for model.matrix — dep_del15 is all NA bc it's what we're predicting
+# model.matrix can't handle factors with < 2 levels, so we clean first
+prep_guess <- function(df, ref_df) {
+  # drop the target
+  df <- df |> select(-any_of("dep_del15"))
+  ref_df <- ref_df |> select(-any_of("dep_del15"))
+
+  # for each factor column, force its levels to match the reference (train_split)
+  # so model.matrix sees the same level set and doesn't throw error on single-level factors
+  for (col in names(df)) {
+    if (is.factor(ref_df[[col]]) && col %in% names(df)) {
+      df[[col]] <- factor(as.character(df[[col]]),
+                          levels = levels(ref_df[[col]]))
+    }
+  }
+  df
+}
+
+guess_clean <- prep_guess(test_guess_model_df, train_split)
+train_no_y <- train_split |> select(-dep_del15)
+
+# XGBoost guess matrix — built from training columns as reference
+guess_xgb_mats <- make_aligned_matrix(
+  ~ .,
+  train_no_y,
+  guess_clean
+)
+dguess <- xgb.DMatrix(data = guess_xgb_mats$x_test)
+xgb_guess <- predict(xgb_model, dguess)
+
+# Logistic regression — predicts directly from data frame, no matrix needed
+log_reg_guess <- predict(log_reg, type = "response", newdata = test_guess_model_df)
+
+# LASSO guess matrix
+guess_lm_mats <- make_aligned_matrix(
+  ~ . + poly(sched_dep_hour, 2),
+  train_no_y,
+  guess_clean
+)
+lasso_guess <- predict(cv_lasso, newx = guess_lm_mats$x_test,
+                        s = "lambda.min", type = "response") |> as.vector()
+
+# RF / Balanced RF
+test_guess_rf <- guess_clean |>
+  mutate(dep_del15 = factor(NA, levels = c("0", "1")))
+test_guess_rf <- align_to_training(test_guess_rf, train_split_rf)
+rf_guess <- predict(rf_model, newdata = test_guess_rf, type = "prob")[, "1"]
+brf_guess <- predict(brf_model, newdata = test_guess_rf, type = "prob")[, "1"]
+
+# Weighted ensemble
+delay.guesses <- 0.50 * xgb_guess +
+                 0.15 * rf_guess +
+                 0.10 * brf_guess +
+                 0.15 * lasso_guess +
+                 0.10 * log_reg_guess
+
+cat("Predictions:", length(delay.guesses),
+    "| NAs:", sum(is.na(delay.guesses)), "\n")
+```
+
+```{r}
+# Save submission file
+team.name <- "Amador"
+test.acc <- 1 - mean(vis_auc$accuracy[vis_auc$model_name == "Ensemble (Weighted)"])
+
+save(list = c("delay.guesses", "test.acc", "team.name"),
+     file = paste0(team.name, "462final.RData"))
+```
+
