@@ -9,5 +9,4 @@ modelling_cache/
 modelling_files/
 models/
 
-*.pdf
 .DS_Store
