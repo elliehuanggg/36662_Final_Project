@@ -61,7 +61,6 @@ train <- bind_rows(
 
 ```{r}
 # Apply the same cleaning steps to each data frame so train and test sets are consistent
-# Apply the same cleaning steps to each data frame so train and test sets are consistent
 clean_flights <- function(df) {
  df |>
  clean_names() |>
@@ -1445,4 +1444,82 @@ vis_auc |> arrange(desc(accuracy))
 ```{r}
 xgb.importance(model = xgb_model) |>
   xgb.plot.importance(top_n = 15, main = "XGBoost feature importance (top 15)")
+```
+
+```{r}
+# Prepare guess data for model.matrix — dep_del15 is all NA bc it's what we're predicting
+# model.matrix can't handle factors with < 2 levels, so we clean first
+prep_guess <- function(df, ref_df) {
+  # drop the target
+  df <- df |> select(-any_of("dep_del15"))
+  ref_df <- ref_df |> select(-any_of("dep_del15"))
+
+  # for each factor column, force its levels to match the reference (train_split)
+  # so model.matrix sees the same level set and doesn't throw error on single-level factors
+  for (col in names(df)) {
+    if (is.factor(ref_df[[col]]) && col %in% names(df)) {
+      df[[col]] <- factor(as.character(df[[col]]),
+                          levels = levels(ref_df[[col]]))
+    }
+  }
+  df
+}
+
+guess_clean <- prep_guess(test_guess_model_df, train_split)
+train_no_y <- train_split |> select(-dep_del15)
+
+# XGBoost guess matrix — built from training columns as reference
+guess_xgb_mats <- make_aligned_matrix(
+  ~ .,
+  train_no_y,
+  guess_clean
+)
+dguess <- xgb.DMatrix(data = guess_xgb_mats$x_test)
+xgb_guess <- predict(xgb_model, dguess)
+
+# Logistic regression — predicts directly from data frame, no matrix needed
+log_reg_guess <- predict(log_reg, type = "response", newdata = test_guess_model_df)
+
+# LASSO guess matrix
+guess_lm_mats <- make_aligned_matrix(
+  ~ . + poly(sched_dep_hour, 2),
+  train_no_y,
+  guess_clean
+)
+lasso_guess <- predict(cv_lasso, newx = guess_lm_mats$x_test,
+                        s = "lambda.min", type = "response") |> as.vector()
+
+# RF / Balanced RF
+test_guess_rf <- guess_clean |>
+  mutate(dep_del15 = factor(NA, levels = c("0", "1")))
+test_guess_rf <- align_to_training(test_guess_rf, train_split_rf)
+rf_guess <- predict(rf_model, newdata = test_guess_rf, type = "prob")[, "1"]
+brf_guess <- predict(brf_model, newdata = test_guess_rf, type = "prob")[, "1"]
+
+# Weighted ensemble
+delay.guesses <- 0.50 * xgb_guess +
+                 0.15 * rf_guess +
+                 0.10 * brf_guess +
+                 0.15 * lasso_guess +
+                 0.10 * log_reg_guess
+
+cat("Predictions:", length(delay.guesses),
+    "| NAs:", sum(is.na(delay.guesses)), "\n")
+```
+
+```{r}
+test_guess_fe |>
+  summarise(
+    pct_has_visible = mean(!is.na(visible_delay_rate)),
+    mean_rate = mean(visible_delay_rate, na.rm = TRUE)
+  )
+```
+
+```{r}
+# Save submission file
+team.name <- "Amador"
+test.acc <- 1 - mean(vis_auc$accuracy[vis_auc$model_name == "Ensemble (Weighted)"])
+
+save(list = c("delay.guesses", "test.acc", "team.name"),
+     file = paste0(team.name, "462final.RData"))
 ```
