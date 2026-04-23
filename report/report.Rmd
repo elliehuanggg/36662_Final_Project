@@ -1,0 +1,36 @@
+---
+title: "Statistical Machine Learning Final Project: Predictions of Flight Delays at the Pittsburgh Airport"
+author:
+  - "Ellie Huang (elliehua)"
+  - "Nikita Jayaprakash (njayapra)"
+documentclass: article
+geometry: margin=1in
+output:
+  bookdown::pdf_document2:
+    toc: no
+    includes:  
+      in_header: preamble-latex.tex
+---
+
+```{r, include=FALSE}
+###########################
+# STYLE EDITS: IGNORE THIS
+###########################
+
+# normally you'll want to include this with the libraries at the beginning of your document
+knitr::opts_chunk$set(message = FALSE) # include this if you don't want markdown to knit messages
+knitr::opts_chunk$set(warning = FALSE) # include this if you don't want markdown to knit warnings
+knitr::opts_chunk$set(echo = FALSE) # set echo = FALSE to hide code from output
+
+```
+
+# Executive summary {.unnumbered}
+
+
+# Introduction
+
+# Exploration
+
+# Supervised Analysis
+
+# Analysis of Results
