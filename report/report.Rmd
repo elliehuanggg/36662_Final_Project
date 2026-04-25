@@ -41,10 +41,9 @@ The metrics of model performance are training set misclassification rate, testin
 
 # Exploration
 
+## Exploratory Data Analysis
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE, cache = TRUE, warning = FALSE, message = FALSE)
-
 library(tidyverse)
 library(adabag)
 library(caret)
@@ -190,7 +189,165 @@ test_visible <- join_inbound(test_visible, inbound_visible)
 test_guess <- join_inbound(test_guess, inbound_guess)
 ```
 
+```{r}
+train |>
+  ggplot(aes(x = factor(dep_del15, 
+                        labels = c("On Time", "Delayed")))) +
+  geom_bar() +
+  labs(
+    title = "The departure delay distribution is very imbalanced",
+    x = "Flight Outcome",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+carrier_delay_tbl <- train |>
+ filter(!is.na(dep_del15)) |>
+ group_by(op_unique_carrier) |>
+ summarise(
+ delay_rate = mean(dep_del15),
+ n = n(),
+ .groups = "drop"
+ ) |>
+ arrange(desc(delay_rate))
+
+carrier_delay_tbl |>
+ ggplot(aes(x = reorder(op_unique_carrier, delay_rate), y = delay_rate)) +
+ geom_col() +
+ coord_flip() +
+ scale_y_continuous(labels = percent_format()) +
+ labs(
+ title = "Delay rate by carrier",
+ x = "carrier",
+ y = "proportion delayed >= 15 min"
+ ) +
+ theme_minimal()
+```
+
+```{r}
+hour_delay_tbl <- train |>
+ filter(!is.na(dep_del15), !is.na(sched_dep_hour)) |>
+ group_by(sched_dep_hour) |>
+ summarise(
+ delay_rate = mean(dep_del15),
+ n = n(),
+ .groups = "drop"
+ )
+
+hour_delay_tbl |>
+ ggplot(aes(x = sched_dep_hour, y = delay_rate)) +
+ geom_line() +
+ geom_point() +
+ scale_x_continuous(breaks = 0:23) +
+ scale_y_continuous(labels = percent_format()) +
+ labs(
+ title = "Delay rate by scheduled departure hour",
+ x = "scheduled departure hour",
+ y = "proportion delayed >= 15 min"
+ ) +
+ theme_minimal()
+```
+
+```{r}
+# Delay rate by calendar date, aligned to a common year for display
+train |>
+ filter(!is.na(dep_del15)) |>
+ mutate(plot_date = make_date(year = 2010, month = as.integer(as.character(month)), day = day_of_month)) |>
+ group_by(plot_date) |>
+ summarise(
+ delay_rate = mean(dep_del15),
+ .groups = "drop"
+ ) |>
+ ggplot(aes(x = plot_date, y = delay_rate)) +
+ geom_line() +
+ scale_x_date(date_labels = "%b", date_breaks = "1 month") +
+ scale_y_continuous(labels = percent_format()) +
+ labs(
+ title = "Daily delay rate across the calendar year",
+ x = NULL,
+ y = "proportion delayed >= 15 min"
+ ) +
+ theme_minimal()
+```
+
+```{r}
+bad_days_tbl <- train |>
+ filter(!is.na(dep_del15)) |>
+ group_by(fl_date) |>
+ summarise(
+ `Delay Rate` = mean(dep_del15),
+ Count = n(),
+ .groups = "drop"
+ ) |>
+ filter(Count >= 10) |>
+ arrange(desc(`Delay Rate`))
+bad_days_tbl |>
+  mutate(`Flight Date` = format(as.Date(fl_date,
+                                        format = "%M-%d-%y"), "%B %d")
+         ) |>
+  head(10) |>
+  select(`Flight Date`, `Delay Rate`, Count) |>
+  gt::gt()
+```
+
+
+```{r}
+top_dests <- train |>
+ count(dest, sort = TRUE) |>
+ slice_head(n = 15) |>
+ pull(dest)
+
+train <- train |>
+ mutate(
+  distance_bucket = case_when(
+  distance > 600 ~ ">600",
+  distance > 300 ~ "301-600",
+  TRUE ~ "<=300"
+ ),
+ distance_bucket = factor(
+ distance_bucket,
+ levels = c("<=300", "301-600", ">600")
+ )
+ )
+
+train |>
+ filter(!is.na(dep_del15), dest %in% top_dests) |>
+ group_by(dest, distance_bucket) |>
+ summarise(
+   delay_rate = mean(dep_del15),
+   n = n(),
+   .groups = "drop"
+ ) |>
+  arrange(delay_rate) |>
+  ggplot(aes(x = reorder(dest, delay_rate), y = delay_rate,
+             fill = distance_bucket)) +
+  geom_col() +
+  coord_flip() +
+  scale_y_continuous(labels = percent_format()) +
+  labs(
+    title = "Delay rate among the busiest PIT destinations",
+    x = "destination",
+    y = "proportion delayed >= 15 min"
+    ) +
+  theme_minimal() + 
+  scale_fill_manual(values = c("lightgreen", "orange", "brown"))
+```
+
+## Feature Engineering
+
+
 
 # Supervised Analysis
 
 # Analysis of Results
+
+\pagebreak
+
+# Appendix {.unnumbered}
+
+<!-- Notice how the appendix below gathers all the code blocks above and nicely pastes them together. -->
+
+```{r ref.label=knitr::all_labels(), echo = T, eval = F}
+```
