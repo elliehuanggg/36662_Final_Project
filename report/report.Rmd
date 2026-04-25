@@ -29,6 +29,16 @@ knitr::opts_chunk$set(echo = FALSE) # set echo = FALSE to hide code from output
 
 # Introduction
 
+
+The goal of this analysis is to predict whether or not a departing flight from Pittsburgh International Airport (airport code PIT) will be delayed based on only information available before the departure of the flight. The dataset is extracted from the Airline On-Time Performance Data from the Bureau of Transportation Statistics of the U.S. Department of Transportation. In addition to metrics about flight delays, it also reflects commercial flight activity to and from PIT. Feature engineering was used to develop additional metrics based on initial exploratory data analysis. This analysis utilizes various machine learning methods in order to attempt this binary classification, including 
+
+- logistic regression with and without regularizatoin
+- XGBoost
+- random forest with and without rebalancing
+- an average of the predictions of these metrics with and without weighting different methods
+
+The metrics of model performance are training set misclassification rate, testing set misclassificatoin rate, and area-under-the-curve (AUC). Based on the findings, ... [insert conclusions here].
+
 # Exploration
 
 # Supervised Analysis
