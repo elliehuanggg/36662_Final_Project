@@ -30,14 +30,8 @@ knitr::opts_chunk$set(echo = FALSE) # set echo = FALSE to hide code from output
 # Introduction
 
 
-The goal of this analysis is to predict whether or not a departing flight from Pittsburgh International Airport (airport code PIT) will be delayed based on only information available before the departure of the flight. The dataset is flight information from 2023 - 2025 extracted from the Airline On-Time Performance Data from the Bureau of Transportation Statistics of the U.S. Department of Transportation. In addition to metrics about flight delays, it also reflects commercial flight activity to and from PIT. Feature engineering was used to develop additional metrics based on initial exploratory data analysis. This analysis utilizes various machine learning methods in order to attempt this binary classification on a subset of the 2025 flights, including 
-
-- logistic regression with and without regularizatoin
-- XGBoost
-- random forest with and without rebalancing
-- an average of the predictions of these metrics with and without weighting different methods
-
-The metrics of model performance are training set misclassification rate, testing set misclassification rate, and area-under-the-curve (AUC). Based on the findings, ... [insert conclusions here].
+The goal of this analysis is to predict whether or not a departing flight from Pittsburgh International Airport (airport code PIT) will be delayed based on only information available before the departure of the flight. The dataset is flight information from 2023 - 2025 extracted from the Airline On-Time Performance Data from the Bureau of Transportation Statistics of the U.S. Department of Transportation. In addition to metrics about flight delays, it also reflects commercial flight activity to and from PIT. Feature engineering was used to develop additional metrics based on initial exploratory data analysis. This analysis utilizes various machine learning methods in order to attempt this binary classification on a subset of the 2025 flights, including logistic regression (with and without LASSO regularization), XGBoost, random forest (with and without rebalancing), and an ensemble method that took an average of the predictions of these metrics (with and without weighting different methods).
+The metrics of model performance are training set misclassification rate, testing set misclassification rate, and area-under-the-curve (AUC). Based on the findings, ... **[insert conclusions here]**.
 
 # Exploration
 
@@ -47,6 +41,7 @@ The metrics of model performance are training set misclassification rate, testin
 library(tidyverse)
 library(adabag)
 library(caret)
+library(gt)
 library(e1071)
 library(tidymodels)
 library(here)
@@ -58,11 +53,12 @@ library(skimr)
 library(scales)
 library(forcats)
 library(ranger)
+library(patchwork)
 library(glmnet)
 library(xgboost)
 ```
 
-```{r include=FALSE}
+```{r}
 # Load data
 flights2023 <- read_csv(here("data", "flights2023.csv")) |>
  clean_names()
@@ -89,7 +85,7 @@ train <- bind_rows(
 ```
 
 
-```{r include=FALSE}
+```{r}
 # Apply the same cleaning steps to each data frame so train and test sets are consistent
 clean_flights <- function(df) {
  df |>
@@ -113,7 +109,7 @@ test_visible <- clean_flights(test_visible)
 test_guess <- clean_flights(test_guess)
 ```
 
-```{r include=FALSE}
+```{r}
 # Restrict to departures from PIT
 train <- train |>
  filter(origin == "PIT")
@@ -123,12 +119,9 @@ test_visible <- test_visible |>
 
 test_guess <- test_guess |>
  filter(origin == "PIT")
-
-# Quick check of the target distribution
-table(train$dep_del15, useNA = "ifany")
 ```
 
-```{r include=FALSE}
+```{r}
 # Inbound flight features
 # For each PIT departure, we try to match the same aircraft (tail + date) arriving at PIT
 # earlier that day. Match rates: ~55% for training, ~15% for guess flights.
@@ -189,20 +182,31 @@ test_visible <- join_inbound(test_visible, inbound_visible)
 test_guess <- join_inbound(test_guess, inbound_guess)
 ```
 
-```{r}
+Due to the data imbalance in Table \@ref(tab:tbl-dep-delay), where there are more on-time flights than delayed, this analysis will need to adjust the threshold that a successful predictive models performs at.
+
+```{r tbl-dep-delay}
 train |>
-  ggplot(aes(x = factor(dep_del15, 
-                        labels = c("On Time", "Delayed")))) +
-  geom_bar() +
-  labs(
-    title = "The departure delay distribution is very imbalanced",
-    x = "Flight Outcome",
-    y = "Count"
-  ) +
-  theme_minimal()
+  mutate(`Flight Outcome` = factor(dep_del15, 
+                        labels = c("On Time", "Delayed"))) |>
+  group_by(`Flight Outcome`) |>
+  summarize(Count = n()) |>
+  gt() |>
+    grand_summary_rows(
+    columns = Count,
+    fns = list(
+      Total = ~sum(.)
+    )
+  ) |>
+  tab_options(
+  table.width = pct(60)
+) |>
+  tab_caption("The departure delay distribution is very imbalanced with some missing values, which may indicate cancelled flights.")
 ```
 
-```{r}
+From Figure \@ref(fig:fig-carrier-delay), delay rates vary meaningfully across carriers, so carrier should be a useful predictor. At the same time, some carriers have much lower flight counts at PIT than others, so raw group means will be noisy. That motivates using smoothed historical delay rates later in feature engineering instead of unsmoothed averages.
+
+
+```{r fig-carrier-delay, fig.cap = "Delay rates and delay counts vary across different carriers, but the carriers with the highest delay rates don't necessarily have the highest delay counts.", fig.height=3}
 carrier_delay_tbl <- train |>
  filter(!is.na(dep_del15)) |>
  group_by(op_unique_carrier) |>
@@ -213,20 +217,36 @@ carrier_delay_tbl <- train |>
  ) |>
  arrange(desc(delay_rate))
 
-carrier_delay_tbl |>
+
+carrier_perc <- carrier_delay_tbl |>
  ggplot(aes(x = reorder(op_unique_carrier, delay_rate), y = delay_rate)) +
  geom_col() +
  coord_flip() +
  scale_y_continuous(labels = percent_format()) +
  labs(
- title = "Delay rate by carrier",
- x = "carrier",
- y = "proportion delayed >= 15 min"
- ) +
- theme_minimal()
+ title = "Delay Rate by Carrier",
+ x = "Carrier",
+ y = "% Delayed More than 15 min"
+ )  +
+ theme_bw()
+
+carrier_count <- carrier_delay_tbl |>
+ ggplot(aes(x = reorder(op_unique_carrier, delay_rate), y = n)) +
+ geom_col() +
+ coord_flip() +
+ labs(
+ title = "Delay Rate by Carrier",
+ x = "Carrier",
+ y = "# Flights Delayed More than 15 min"
+ )  +
+ theme_bw()
+
+carrier_perc + carrier_count
 ```
 
-```{r}
+Figure \@ref(fig:fig-delay-hr) shows that early flights start the day with fewer disruptions from previous legs, while later flights are more exposed to effects from earlier problems. This makes scheduled departure hour one of the strongest single predictors in the dataset.
+
+```{r fig-delay-hr, fig.cap = "Delay rates rise steadily over the course of the day and are highest in the evening", fig.height=3}
 hour_delay_tbl <- train |>
  filter(!is.na(dep_del15), !is.na(sched_dep_hour)) |>
  group_by(sched_dep_hour) |>
@@ -243,14 +263,16 @@ hour_delay_tbl |>
  scale_x_continuous(breaks = 0:23) +
  scale_y_continuous(labels = percent_format()) +
  labs(
- title = "Delay rate by scheduled departure hour",
- x = "scheduled departure hour",
- y = "proportion delayed >= 15 min"
+ title = "Delay Rate by Scheduled Departure Hour",
+ x = "Scheduled Departure Hour",
+ y = "% Delayed Over 15 min"
  ) +
- theme_minimal()
+ theme_bw()
 ```
 
-```{r}
+Figure \@ref(fig:fig-calendar-delay) show s that elays are worse in the summer months and in December, which is consistent with heavier travel volume and more weather-related disruption. Since these seasonal peaks are not spread evenly across the month, this supports adding a simple calendar feature rather than relying only on month.
+
+```{r fig-calendar-delay, warning = F, fig.cap = "There are seasonal peaks, but the delays are not spread evenly across the month.", fig.height=3}
 # Delay rate by calendar date, aligned to a common year for display
 train |>
  filter(!is.na(dep_del15)) |>
@@ -266,13 +288,16 @@ train |>
  scale_y_continuous(labels = percent_format()) +
  labs(
  title = "Daily delay rate across the calendar year",
- x = NULL,
- y = "proportion delayed >= 15 min"
+ x = "Calendar Date",
+ y = "% Delayed Over 15 min"
  ) +
  theme_minimal()
 ```
 
-```{r}
+Further investigating specific calendar days with high delay rates, Table \@ref(tab:tbl-bad-days) suggests that there are broader operating shocks affecting many flights at once. That motivates adding dynamic same-day features based on earlier visible flights, along with a historical calendar-day disruption feature learned from the training data.
+
+
+```{r tbl-bad-days}
 bad_days_tbl <- train |>
  filter(!is.na(dep_del15)) |>
  group_by(fl_date) |>
@@ -282,18 +307,25 @@ bad_days_tbl <- train |>
  .groups = "drop"
  ) |>
  filter(Count >= 10) |>
- arrange(desc(`Delay Rate`))
+ arrange(desc(`Delay Rate`)) |>
+  mutate(fl_date = as.character(fl_date))
 bad_days_tbl |>
-  mutate(`Flight Date` = format(as.Date(fl_date,
-                                        format = "%M-%d-%y"), "%B %d")
-         ) |>
+  mutate(`Flight Date` = format(as.Date(fl_date, format = "%m-%d-%y"), "%B %d")
+) |>
   head(10) |>
   select(`Flight Date`, `Delay Rate`, Count) |>
-  gt::gt()
+  gt() |>
+  tab_options(
+  table.width = pct(60)
+) |>
+  tab_caption("A small number of days have unusually high delay rates and delay counts.")
 ```
 
 
-```{r}
+Figure \@ref(fig:fig-delay-dest) shows that delay rates differ across destinations, even among the busiest PIT routes, which suggests that route context adds information beyond carrier and time of day alone. Longer routes also show higher delay rates on average, so distance should remain in the model and may be easier to capture through both a raw continuous version and a bucketed factor version.
+
+
+```{r fig-delay-dest,fig.cap = "Longer routes and the specific destinations tend to have higher delay rates.", fig.height=3}
 top_dests <- train |>
  count(dest, sort = TRUE) |>
  slice_head(n = 15) |>
@@ -301,20 +333,20 @@ top_dests <- train |>
 
 train <- train |>
  mutate(
-  distance_bucket = case_when(
+  `Distance` = case_when(
   distance > 600 ~ ">600",
   distance > 300 ~ "301-600",
   TRUE ~ "<=300"
  ),
- distance_bucket = factor(
- distance_bucket,
+ `Distance` = factor(
+ `Distance`,
  levels = c("<=300", "301-600", ">600")
  )
  )
 
 train |>
  filter(!is.na(dep_del15), dest %in% top_dests) |>
- group_by(dest, distance_bucket) |>
+ group_by(dest, `Distance`) |>
  summarise(
    delay_rate = mean(dep_del15),
    n = n(),
@@ -322,26 +354,66 @@ train |>
  ) |>
   arrange(delay_rate) |>
   ggplot(aes(x = reorder(dest, delay_rate), y = delay_rate,
-             fill = distance_bucket)) +
+             fill = `Distance`)) +
   geom_col() +
   coord_flip() +
   scale_y_continuous(labels = percent_format()) +
   labs(
-    title = "Delay rate among the busiest PIT destinations",
-    x = "destination",
-    y = "proportion delayed >= 15 min"
+    title = "Delay Rates Among the Busiest PIT Destinations",
+    x = "Destination",
+    y = "% Delayed Over 15 min"
     ) +
   theme_minimal() + 
-  scale_fill_manual(values = c("lightgreen", "orange", "brown"))
+  scale_fill_manual(values = c("darkgreen", "orange", "brown"))
 ```
 
-## Feature Engineering
+## Dimension Reduction
 
+This analysis applied principal component analysis (PCA) on a subset of various that were considered important to predicting delay through the previous EDA. These variables were month, day of the month, day of the week, the carrier, the distance and the destination. As shown in Figure \@ref(fig:fig-pca), while this does create clusters, these clusters do not seem useful for differentiating delayed and on-time flights, so the principal components will not be used for feature engineering. Feature engineering will be developed based on the intuition built from the exploratory data analysis.
+
+```{r fig-pca,fig.cap = "While PCA does create distinct clusters, they do not seem to differentiate delayed status.", fig.height=3}
+train_pca <- train |>
+  select(dep_del15, month, day_of_month, day_of_week,
+         op_unique_carrier, distance, dest) |>
+  drop_na()
+train_pca_matrix <- model.matrix(dep_del15 ~ .,
+                                 data = train_pca)[, -1]
+train_pca_matrix <- train_pca_matrix[, (apply(train_pca_matrix, 2, var) != 0)]
+pca_result <- prcomp(train_pca_matrix, center = TRUE, scale. = TRUE)
+# Convert PCA scores to a data frame
+pca_df <- as.data.frame(pca_result$x)
+
+# Add the outcome variable for coloring
+pca_df$dep_del15 <- factor(train_pca$dep_del15,
+                           labels = c("On Time", "Delayed"))
+
+# Plot PC1 vs PC2
+ggplot(pca_df, aes(x = PC1, y = PC2, color = dep_del15)) +
+  geom_point(alpha = 0.5) +
+  labs(
+    title = "PCA: First Two Principal Components",
+    x = "PC1",
+    y = "PC2",
+    color = "Departure Delay (15+ min)"
+  ) +
+  theme_minimal() +
+  scale_color_manual(values = c("darkgreen", "red"))
+```
 
 
 # Supervised Analysis
 
+## Feature Engineering
+
+## Machine Learning Techniques
+
 # Analysis of Results
+
+## What kinds of flights do you do well or poorly on?
+
+## Predicting Minutes Delayed
+
+## Trade-Off of a Fixed Cost
 
 \pagebreak
 
