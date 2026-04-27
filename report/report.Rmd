@@ -437,7 +437,7 @@ All predictive modelling methods used in this analysis had the same collection o
 
 This analysis used a variety of machine learning methods with different variations. As previously mentioned, all methods used the same set of covariates and the same predictor variable, so the changes in modelling performance are attributed to the choice of method. Since this is a binary classification problem, we iterated through different classification methods with varying advantages and disadvantages in order to find the best-performing model based on accuracy and AUC. Logistic regression was the first fitted model because it's a simple, interpretable model. The second model was logistic regression with LASSO in order to reduce variance from the first model. We fit XGBoost with **FINISH how we tuned**. We fit a random forest with 300 trees (a large value that would reduce variance). We also fit a balanced random with the same 300 trees forest in an effort control for the imbalanced base rate. Finally, we tried creating two ensemble predictors, which took the naive average and a weighted average of the predicted probabilities from all above methods. The weighted average were manually weighted to add more weight to the more accurate methods (i.e. $Ensemble_{weighted} = 0.55 \times xgboost + 0.20 \times rf + 0.15 \times lasso + 0.10 \times log_reg$). Since the balanced random forest did not improve accuracy from the regular random forest, this was discarded for the weighted ensemble predictor.
 
-**FINISH justification**
+**FINISH justification, maybe about parametric vs. nonparametrics??**
 
 ## Testing and Validation
 
@@ -470,4 +470,18 @@ knitr::include_graphics("XGBoost-Feature-Importance.png")
 
 ## Predicting Minutes Delayed
 
+If this transitioned into a regression problem, where we made continuous predictions about the minutes delayed, we would shift from the AUC loss function to the mean absolute error as our loss function because it's a loss function suitable to regression and, since the delay times can be strongly right-skewed, it will be more robust to outliers (as compared to the traditional mean squared error). In addition, we would use regression machine-learning methods with varying complexity and again use an ensemble predictor using both a naive average and a weighted average. To start, we would use linear regression with and without LASSO to begin with a simple model. Then, we would transition to more complex methods, such as XGBoost and random forest (again, the naive random forest and balanced random forest).
+
 ## Trade-Off of a Fixed Cost
+
+Assume that we cared about a trade-off of a fixed cost C for missing a flight and an hourly cost r of waiting for a delayed flight. We would transition to a regression problem, similar to above (i.e. where we made continuous predictions about the minutes delayed), and we would use the regression methods highlighted above. However, instead of mean absolute error, we would use the following loss function:
+
+$$\left\{
+\begin{aligned}
+r \times (y - \hat{delay})^2 \ if\ y > \hat{y} \\\\
+C\ if\ y < \hat{y} \\\\
+0\ else
+\end{aligned}
+\right.$$
+
+We are transitioning to squared error for underpredicting delays because we no longer want a loss function that is robust to outliers. In this case, waiting for a delayed flight has loss proportional to the length of the delay (i.e. *r*), so we want strong outliers to be influential since they represent a huge loss contextually. In addition, we are implementing weighted MSE because there is a proportional loss for predicting 0 when there is any delay (i.e. $r$) and a fixed-rate loss for predicting a delay when the flight is on-time or early (i.e. $C$).
