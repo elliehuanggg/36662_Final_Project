@@ -457,15 +457,11 @@ First, the data from 2023 to 2024 was divided into a training and validation spl
 :  The methods are ordered by descending AUC since their accuracy rates are comparable. The ensemble techniques have the strongest AUC values. (#tab:auc-accuracy)
 
 Since XGBoost had the highest training accuracy, we analyzed the feature importance of the covariates in order to explore 
-the nature of the relationship between the predictors in your model and the predictions themselves. Based on the feature importance from Figure \@ref(fig:fig-feat-import)
+the nature of the relationship between the predictors in your model and the predictions themselves. Based on the feature importance from Figure \@ref(fig:fig-feat-import), the features with the strongest feature importance were `visible_carrier_delay_rate`, `sched_dep_hour`, `sched_arr_hour` and `route_delay_rate_smooth`. This shows that the timing of the flights and the historical delays of the carrier and routes make strong predictors for delays. Based on this, it's possible that flights with specific times and on specifics carriers or routes are more easily predicted.
 
 ```{r fig-feat-import, fig.cap="The scheduled departure time, scheduled arrival time, and metrics about related delay rates have the strongest feature importance in the tuned XGBoost model.", fig.align='center', out.width='80%'}
 knitr::include_graphics("XGBoost-Feature-Importance.png")
 ```
-
-
-
-
 
 
 # Analysis of Results
