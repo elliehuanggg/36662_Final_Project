@@ -435,16 +435,13 @@ All predictive modelling methods used in this analysis had the same collection o
 
 ## Machine Learning Techniques
 
-This analysis used a variety of machine learning methods with different variations. As previously mentioned, all methods used the same set of covariates and the same predictor variable, so the changes in modelling performance are attributed to the choice of method. 
+This analysis used a variety of machine learning methods with different variations. As previously mentioned, all methods used the same set of covariates and the same predictor variable, so the changes in modelling performance are attributed to the choice of method. Since this is a binary classification problem, we iterated through different classification methods with varying advantages and disadvantages in order to find the best-performing model based on accuracy and AUC. Logistic regression was the first fitted model because it's a simple, interpretable model. The second model was logistic regression with LASSO in order to reduce variance from the first model. We fit XGBoost with **FINISH how we tuned**. We fit a random forest with 300 trees (a large value that would reduce variance). We also fit a balanced random with the same 300 trees forest in an effort control for the imbalanced base rate. Finally, we tried creating two ensemble predictors, which took the naive average and a weighted average of the predicted probabilities from all above methods. The weighted average were manually weighted to add more weight to the more accurate methods (i.e. $Ensemble_{weighted} = 0.55 \times xgboost + 0.20 \times rf + 0.15 \times lasso + 0.10 \times log_reg$). Since the balanced random forest did not improve accuracy from the regular random forest, this was discarded for the weighted ensemble predictor.
+
+**FINISH justification**
 
 ## Testing and Validation
 
-**how we did training/testing split + validation set**
-
 First, the data from 2023 to 2024 was divided into a training and validation split with an 80-20 split. The training data was used train the models, and the validation method was used to tune and test the methods based on accuracy rates. After model tuning, the AUC and accuracy were computed on the held-out testing set, which has a subset of flights from 2025. As shown by Table \@ref(tab:auc-accuracy), the accuracy rates across this final models are comparable around 88%, so we used the AUC rates as the distinguishing factor. Since the weighted ensemble method had the strongest AUC, this analysis determined that this was the strongest model and used these predictions.
-
-how did you make your predictions? Describe this process in detail. Again, you can use any of the classification techniques that we learned in the course, or many other related techniques, so long as they are adequately described. What predictor variables did you include? How did you engineer features from the data? What technique did you use for prediction, and why did you choose it? If there were tuning parameters, how did you pick their values? Can you explain anything about the nature of the relationship between the predictors in your model and the predictions themselves?
-
 
 
 | Modelling Method | $AUC_{2025}$ | $Accuracy_{2025}$ |
@@ -458,6 +455,18 @@ how did you make your predictions? Describe this process in detail. Again, you c
 | Balanced Random Forest |0.6075110|0.8862799|
 
 :  The methods are ordered by descending AUC since their accuracy rates are comparable. The ensemble techniques have the strongest AUC values. (#tab:auc-accuracy)
+
+Since XGBoost had the highest training accuracy, we analyzed the feature importance of the covariates in order to explore 
+the nature of the relationship between the predictors in your model and the predictions themselves. Based on the feature importance from Figure \@ref(fig:fig-feat-import)
+
+```{r fig-feat-import, fig.cap="The scheduled departure time, scheduled arrival time, and metrics about related delay rates have the strongest feature importance in the tuned XGBoost model.", fig.align='center', out.width='80%'}
+knitr::include_graphics("XGBoost-Feature-Importance.png")
+```
+
+
+
+
+
 
 # Analysis of Results
 
