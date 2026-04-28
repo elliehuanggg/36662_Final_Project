@@ -241,7 +241,7 @@ carrier_perc + carrier_count
 
 Figure \@ref(fig:fig-delay-hr) shows that early flights start the day with fewer disruptions from previous legs, while later flights are more exposed to effects from earlier problems. This makes scheduled departure hour one of the strongest single predictors in the dataset.
 
-```{r fig-delay-hr, fig.height = 2, fig.width = 8, fig.cap = "Delay rates rise steadily over the course of the day and are highest in the evening", fig.height=3}
+```{r fig-delay-hr, fig.height = 2, fig.width = 6, fig.cap = "Delay rates rise steadily over the course of the day and are highest in the evening"}
 hour_delay_tbl <- train |>
  filter(!is.na(dep_del15), !is.na(sched_dep_hour)) |>
  group_by(sched_dep_hour) |>
