@@ -1589,7 +1589,7 @@ test_guess_fe |>
 ```{r}
 # Save submission file
 team.name <- "Amador"
-test.acc <- 1 - mean(vis_auc$accuracy[vis_auc$model_name == "Ensemble (Weighted)"])
+test.acc <- vis_auc$accuracy[vis_auc$model_name == "Ensemble (Weighted)"][1]
 
 save(list = c("delay.guesses", "test.acc", "team.name"),
      file = paste0(team.name, "462final.RData"))
